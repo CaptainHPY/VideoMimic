@@ -67,10 +67,10 @@ class TaskRegistry():
             # load config files
             env_cfg, _ = self.get_cfgs(name)
         # override cfg from args (if specified)
-        env_cfg, _ = update_cfg_from_args(env_cfg, None, args)
         if env_overrides is not None:
             update_cfg_from_overrides(env_cfg, env_overrides)
             print(env_overrides)
+        env_cfg, _ = update_cfg_from_args(env_cfg, None, args)
         print(env_cfg)
         set_seed(env_cfg.seed)
         # parse sim params (convert to dict first)
