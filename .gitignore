@@ -1,3 +1,8 @@
-simulation/data/checkpoints
-simulation/data/unitree_lafan
-simulation/data/videomimic_captures
+.vscode/
+__pycache__/
+isaacgym/
+pyroki/
+checkpoints/
+unitree_lafan/
+videomimic_captures/
+mocap_xia/
