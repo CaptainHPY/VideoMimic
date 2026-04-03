@@ -8,6 +8,24 @@ from tqdm import tqdm
 from typing import Optional
 import random
 
+SHARED_FLAT_TERRAIN_TOKEN = '__shared_flat_terrain__'
+
+
+def create_flat_plane_mesh(size=20.0, z=0.0):
+    """Create a simple flat plane mesh centered at origin."""
+    half = size * 0.5
+    vertices = np.array([
+        [-half, -half, z],
+        [half, -half, z],
+        [half, half, z],
+        [-half, half, z],
+    ], dtype=np.float32)
+    triangles = np.array([
+        [0, 1, 2],
+        [0, 2, 3],
+    ], dtype=np.uint32)
+    return vertices, triangles
+
 def generate_terrain_noise(vertices, base_frequency=0.2, amplitude=0.1, octaves=3, persistence=0.5):
     """
     Generate smooth, multi-scale noise for terrain height variation using numpy.
@@ -155,7 +173,7 @@ def convert_mesh_to_heightfield(mesh_file, resolution):
 
     return vertices, triangles
 
-def load_all_meshes(mesh_files, convert_to_heightfield: bool = False):
+def load_all_meshes(mesh_files, convert_to_heightfield: bool = False, cfg=None):
     """
     Load all meshes matching the given glob pattern. Optionally converts them to heightfields.
     Uses a cache to avoid reprocessing identical mesh files.
@@ -163,6 +181,7 @@ def load_all_meshes(mesh_files, convert_to_heightfield: bool = False):
     Args:
         mesh_files (list): List of mesh files.
         convert_to_heightfield (bool): If True, convert meshes to heightfields.
+        cfg: Terrain config for flat fallback options.
 
     Returns:
         list: List of tuples (vertices, triangles) for each mesh (original or heightfield).
@@ -175,21 +194,41 @@ def load_all_meshes(mesh_files, convert_to_heightfield: bool = False):
     print(f"Processing {len(mesh_files)} unique mesh files ({action})...")
     print(mesh_files)
 
+    flat_size = float(getattr(cfg, 'flat_terrain_size', 20.0))
+    flat_z = float(getattr(cfg, 'flat_terrain_z', 0.0))
+    auto_flat_if_missing = bool(getattr(cfg, 'auto_flat_if_mesh_missing', False))
+
     for mesh_file in tqdm(mesh_files):
         if mesh_file in mesh_cache:
             # Load from cache
             vertices, triangles = mesh_cache[mesh_file]
         else:
             # Process mesh
-            if convert_to_heightfield:
+            if mesh_file == SHARED_FLAT_TERRAIN_TOKEN:
+                print(f"Using shared generated flat terrain mesh: size={flat_size}, z={flat_z}")
+                vertices, triangles = create_flat_plane_mesh(size=flat_size, z=flat_z)
+            elif convert_to_heightfield:
                 print(f"Converting {mesh_file} to heightfield...")
                 vertices, triangles = convert_mesh_to_heightfield(mesh_file, resolution)
             else:
-                print(f"Loading original mesh {mesh_file}...")
-                mesh = trimesh.load(mesh_file)
-                vertices = np.array(mesh.vertices, dtype=np.float32)
-                triangles = np.array(mesh.faces, dtype=np.uint32)
-                print(f"Mesh: {os.path.basename(mesh_file)} - Original Tris: {len(triangles)}")
+                if not os.path.exists(mesh_file):
+                    if auto_flat_if_missing:
+                        print(
+                            f"Terrain mesh not found ({mesh_file}), "
+                            f"using generated flat terrain size={flat_size}, z={flat_z}."
+                        )
+                        vertices, triangles = create_flat_plane_mesh(size=flat_size, z=flat_z)
+                    else:
+                        raise FileNotFoundError(
+                            f"Terrain mesh not found: {mesh_file}. "
+                            "Set --env.terrain.auto_flat_if_mesh_missing=True to auto-generate flat terrain."
+                        )
+                else:
+                    print(f"Loading original mesh {mesh_file}...")
+                    mesh = trimesh.load(mesh_file)
+                    vertices = np.array(mesh.vertices, dtype=np.float32)
+                    triangles = np.array(mesh.faces, dtype=np.uint32)
+                    print(f"Mesh: {os.path.basename(mesh_file)} - Original Tris: {len(triangles)}")
 
             # Store in cache
             mesh_cache[mesh_file] = (vertices, triangles)
@@ -217,6 +256,10 @@ def duplicate_mesh_grid_multi(meshes, n_rows, noise_config=None):
         new_triangles: numpy array of duplicated face indices
     """
     n_meshes = len(meshes)
+    if n_meshes == 0:
+        raise ValueError(
+            "No terrain meshes were loaded. Check replay data / terrain path configuration and ensure matching files exist."
+        )
     n_cols = n_meshes  # One column per unique mesh
     
     # Calculate the maximum dimensions across all meshes
@@ -324,7 +367,7 @@ class DeepMimicTerrain:
         self.cfg = cfg
         # Determine if heightfield conversion is needed from cfg
         convert_to_heightfield = getattr(cfg, 'cast_mesh_to_heightfield', False) # Default to False if not specified
-        self.meshes = load_all_meshes(terrain_paths, convert_to_heightfield=convert_to_heightfield)
+        self.meshes = load_all_meshes(terrain_paths, convert_to_heightfield=convert_to_heightfield, cfg=cfg)
         self.n_terrains = len(self.meshes)
 
         # Calculate max dimensions for spacing

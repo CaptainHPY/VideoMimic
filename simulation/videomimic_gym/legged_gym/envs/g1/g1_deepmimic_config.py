@@ -129,6 +129,8 @@ class LeggedRobotDeepMimicCfg:
     # Path to a YAML file listing human motion clips (relative to LEGGED_GYM_ROOT_DIR)
     # OR the name of a single human motion data folder (relative to data_root in g1_deepmimic.py)
     human_motion_source: str = 'resources/data_config/human_motion_list.yaml'
+    # Allow directly providing a single .h5 path or glob pattern (e.g. ../data/mocap_xia/*.h5).
+    allow_h5_direct_source = False
     # human_video_folders = [ # OLD LIST - REMOVED
     #     # ... old list content ...
     # ]
@@ -159,6 +161,10 @@ class LeggedRobotDeepMimicTerrainCfg(LeggedRobotTerrainCfg):
 
     alternate_cast_to_heightfield = False
     cast_mesh_to_heightfield = False
+    # If True, missing terrain meshes are replaced by a generated flat plane.
+    auto_flat_if_mesh_missing = False
+    flat_terrain_size = 20.0
+    flat_terrain_z = 0.0
 
 
 @configclass
@@ -669,8 +675,8 @@ class G1DeepMimicCfg(LeggedRobotCfg):
             # max_depenetration_velocity = 1.0
             max_depenetration_velocity = 0.1,
             # max_gpu_contact_pairs = 2**23, #2**24 -> needed for 8000 envs and more
-            # max_gpu_contact_pairs = 2**24, #2**24 -> needed for 8000 envs and more
-            max_gpu_contact_pairs = 2**25, #2**24 -> needed for 8000 envs and more
+            max_gpu_contact_pairs = 2**24, #2**24 -> needed for 8000 envs and more
+            # max_gpu_contact_pairs = 2**25, #2**24 -> needed for 8000 envs and more
             default_buffer_size_multiplier = 5,
             contact_collection = 2, # 0: never, 1: last sub-step, 2: all sub-steps (default=2)
         )
@@ -1246,7 +1252,7 @@ class G1DeepMimicCfgPPO(LeggedRobotCfgPPO):
     runner = LeggedRobotRunnerCfg(
         max_iterations = 100000,
         experiment_name = 'g1_deepmimic',
-        save_interval = 500,
+        save_interval = 10000,
         # policy_class_name = 'ActorCriticRecurrent',
     )
 

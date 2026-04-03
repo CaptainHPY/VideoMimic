@@ -146,7 +146,33 @@ class G1DeepMimic(RobotDeepMimic, G1Robot):
         # --- Human Video Data --- #
         if hasattr(cfg.deepmimic, 'use_human_videos') and cfg.deepmimic.use_human_videos:
             source = cfg.deepmimic.human_motion_source
-            if source.lower().endswith('.yaml'):
+            if isinstance(source, str) and source.lower().endswith('.h5'):
+                if not getattr(cfg.deepmimic, 'allow_h5_direct_source', False):
+                    raise ValueError(
+                        "Direct .h5 human_motion_source is disabled. "
+                        "Set --env.deepmimic.allow_h5_direct_source=True to enable it."
+                    )
+
+                source_path = source if os.path.isabs(source) else os.path.join(LEGGED_GYM_ROOT_DIR, source)
+                replay_h5_paths = sorted(glob.glob(source_path)) if any(ch in source_path for ch in ['*', '?', '[']) else [source_path]
+                replay_h5_paths = [p for p in replay_h5_paths if p.lower().endswith('.h5')]
+
+                if not replay_h5_paths:
+                    raise ValueError(
+                        "No .h5 files found for human_motion_source. "
+                        f"Resolved pattern/path: {source_path}"
+                    )
+
+                shared_flat_terrain_token = '__shared_flat_terrain__'
+                single_h5_ckpt_idx = -1
+                for replay_h5_path in replay_h5_paths:
+                    for _ in range(cfg.deepmimic.human_video_oversample_factor):
+                        replay_data_paths.append(replay_h5_path)
+                        terrain_paths.append(shared_flat_terrain_token)
+                        local_data_fps_override.append(None)
+                        local_terrain_to_checkpoint_idx.append(single_h5_ckpt_idx)
+
+            elif source.lower().endswith('.yaml'):
                 # Load from YAML file
                 yaml_path = os.path.join(LEGGED_GYM_ROOT_DIR, source)
                 try:
@@ -257,10 +283,15 @@ class G1DeepMimic(RobotDeepMimic, G1Robot):
                     terrain_paths.append(os.path.join(folder_path_abs, terrain_pattern))
                     local_terrain_to_checkpoint_idx.append(single_folder_ckpt_idx)
             else:
-                print(f"Warning: Invalid human_motion_source format: {source}. Expected YAML path or folder name.")
+                print(f"Warning: Invalid human_motion_source format: {source}. Expected YAML path, folder name, or .h5 path/glob.")
 
         if not replay_data_paths:
-             print("Warning: No replay data paths were loaded. Check AMASS and human video configurations.")
+            amass_search_path = os.path.join(amass_data_root, cfg.deepmimic.amass_replay_data_path)
+            raise ValueError(
+                "No replay data paths were loaded. "
+                f"AMASS search path: {amass_search_path}. "
+                "Check --env.deepmimic.amass_replay_data_path and data root settings."
+            )
 
         # Assign the generated lists to instance variables
         self.teacher_checkpoints = local_teacher_checkpoints
@@ -291,7 +322,11 @@ class G1DeepMimic(RobotDeepMimic, G1Robot):
         # --- Human Video Episodes --- #
         if hasattr(self.cfg.deepmimic, 'use_human_videos') and self.cfg.deepmimic.use_human_videos:
             source = self.cfg.deepmimic.human_motion_source
-            if source.lower().endswith('.yaml'):
+            if isinstance(source, str) and source.lower().endswith('.h5'):
+                source_path = source if os.path.isabs(source) else os.path.join(LEGGED_GYM_ROOT_DIR, source)
+                replay_h5_paths = sorted(glob.glob(source_path)) if any(ch in source_path for ch in ['*', '?', '[']) else [source_path]
+                available_episodes.extend([os.path.splitext(os.path.basename(p))[0] for p in replay_h5_paths])
+            elif source.lower().endswith('.yaml'):
                 yaml_path = os.path.join(LEGGED_GYM_ROOT_DIR, source)
                 try:
                     with open(yaml_path, 'r') as f:
