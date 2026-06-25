@@ -224,15 +224,13 @@ for smpl_name, g1_name in [
     ("RightFoot", "right_ankle_pitch_link"),
     ("LeftArm", "left_shoulder_roll_link"),
     ("RightArm", "right_shoulder_roll_link"),
-    ("LeftToeBase", "left_ankle_roll_link"),
-    ("RightToeBase", "right_ankle_roll_link"),
 ]:
     smpl_joint_retarget_indices_to_g1.append(smpl_joint_names.index(smpl_name))
     g1_link_retarget_indices.append(g1_link_names.index(g1_name))
 
 feet_link_pairs_g1 = [
-    ("LeftToeBase", "left_ankle_roll_link"),
-    ("RightToeBase", "right_ankle_roll_link"),
+    ("LeftFoot", "left_ankle_roll_link"),
+    ("RightFoot", "right_ankle_roll_link"),
 ]
 ankle_link_pairs_g1 = [
     ("LeftFoot", "left_ankle_pitch_link"),
@@ -871,12 +869,12 @@ def retarget_human_to_robot(
                 weights["smoothness_cost_factor_weight"] * weights["padding_norm_factor_weight"]
             ) * valid_timesteps[1:],
         ),
-        # hip_yaw_and_pitch_cost(
-        #     var_joints,
-        #     weights["hip_yaw_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        #     weights["hip_pitch_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        #     weights["hip_roll_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        # ),
+        hip_yaw_and_pitch_cost(
+            var_joints,
+            weights["hip_yaw_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+            weights["hip_pitch_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+            weights["hip_roll_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        ),
         root_smoothness(
             jaxls.SE3Var(jnp.arange(1, num_timesteps)),
             jaxls.SE3Var(jnp.arange(0, num_timesteps-1)),
