@@ -98,6 +98,11 @@ class OnPolicyRunner:
         # init storage and model
         env_obs_shapes = self.env.get_obs_shapes()
         used_obs_keys = set(self.policy_cfg["obs_proc_actor"].keys()) | set(self.policy_cfg["obs_proc_critic"].keys()) | set((self.alg.multi_teacher_select_obs_var,))
+        # Keep index-like debug signals in rollout storage so actor-side NaN diagnostics
+        # can map a bad sample back to the source replay clip.
+        for debug_key in ("clip_index", "episode_indices", "episode_index", "index_within_episode"):
+            if debug_key in env_obs_shapes:
+                used_obs_keys.add(debug_key)
         used_obs_shapes = {k: env_obs_shapes[k] for k in used_obs_keys}
 
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, used_obs_shapes, [self.env.num_actions])
@@ -115,6 +120,14 @@ class OnPolicyRunner:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+
+        # Console episode log controls (TensorBoard logging keeps all keys)
+        self.console_ep_log = self.cfg.get("console_ep_log", True)
+        self.console_ep_log_keys = self.cfg.get("console_ep_log_keys", None)
+        self.console_ep_log_prefixes = self.cfg.get("console_ep_log_prefixes", None)
+        self.console_ep_log_exclude = set(self.cfg.get("console_ep_log_exclude", []))
+        self.console_ep_log_max_items = int(self.cfg.get("console_ep_log_max_items", 6))
+        self.console_ep_log_sort = self.cfg.get("console_ep_log_sort", "name")
 
         _ = self.env.reset()
 
@@ -217,6 +230,7 @@ class OnPolicyRunner:
             all_keys = set()
             for ep_info in locs['ep_infos']:
                 all_keys.update(ep_info.keys())
+            ep_means = {}
             for key in all_keys:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs['ep_infos']:
@@ -229,7 +243,34 @@ class OnPolicyRunner:
                         infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 self.writer.add_scalar(key, value, locs['it'])
-                ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                ep_means[key] = value.item()
+
+            if self.console_ep_log:
+                if isinstance(self.console_ep_log_keys, (list, tuple)) and len(self.console_ep_log_keys) > 0:
+                    selected_items = [(k, ep_means[k]) for k in self.console_ep_log_keys if k in ep_means]
+                else:
+                    selected_items = list(ep_means.items())
+
+                if isinstance(self.console_ep_log_prefixes, (list, tuple)) and len(self.console_ep_log_prefixes) > 0:
+                    selected_items = [(k, v) for k, v in selected_items if any(k.startswith(p) for p in self.console_ep_log_prefixes)]
+
+                if self.console_ep_log_exclude:
+                    selected_items = [(k, v) for k, v in selected_items if k not in self.console_ep_log_exclude]
+
+                if self.console_ep_log_sort == 'value_desc':
+                    selected_items.sort(key=lambda x: x[1], reverse=True)
+                elif self.console_ep_log_sort == 'value_asc':
+                    selected_items.sort(key=lambda x: x[1])
+                else:
+                    selected_items.sort(key=lambda x: x[0])
+
+                hidden_count = max(0, len(selected_items) - self.console_ep_log_max_items)
+                selected_items = selected_items[:self.console_ep_log_max_items]
+
+                for key, value in selected_items:
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                if hidden_count > 0:
+                    ep_string += f"""{f'Mean episode ...':>{pad}} +{hidden_count} more metrics\n"""
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
@@ -253,21 +294,31 @@ class OnPolicyRunner:
         actor_attention = None
         critic_attention = None
 
-        if 'terrain_height' in self.alg.actor_critic.actor_input_net.heads:
-            actor_attention = self.alg.actor_critic.actor_input_net.heads['terrain_height'].state_dict()['attention']
-        elif 'terrain_height' in self.alg.actor_critic.actor_input_net.extra_proj_heads:
-            actor_attention = self.alg.actor_critic.actor_input_net.extra_proj_heads['terrain_height'].state_dict()['attention']
-        
+        def _get_attention(input_nets, obs_name):
+            for input_net in input_nets:
+                if input_net is None:
+                    continue
+                if obs_name in input_net.heads:
+                    return input_net.heads[obs_name].state_dict()['attention']
+                if obs_name in input_net.extra_proj_heads:
+                    return input_net.extra_proj_heads[obs_name].state_dict()['attention']
+            return None
+
+        actor_input_nets = [
+            getattr(self.alg.actor_critic, name, None)
+            for name in ('actor_shared_input_net', 'actor_content_input_net', 'actor_style_input_net', 'actor_input_net')
+        ]
+        critic_input_nets = [
+            getattr(self.alg.actor_critic, name, None)
+            for name in ('critic_shared_input_net', 'critic_content_input_net', 'critic_style_input_net', 'critic_input_net')
+        ]
+
+        actor_attention = _get_attention(actor_input_nets, 'terrain_height')
         if actor_attention is not None:
             self.writer.add_scalar('Network/attention_terrain_height_actor', torch.abs(actor_attention).mean(), locs['it'])
             self.writer.add_scalar('Network/max_attention_terrain_height_actor', actor_attention.max(), locs['it'])
 
-        
-        if 'terrain_height' in self.alg.actor_critic.critic_input_net.heads:
-            critic_attention = self.alg.actor_critic.critic_input_net.heads['terrain_height'].state_dict()['attention']
-        elif 'terrain_height' in self.alg.actor_critic.critic_input_net.extra_proj_heads:
-            critic_attention = self.alg.actor_critic.critic_input_net.extra_proj_heads['terrain_height'].state_dict()['attention']
-        
+        critic_attention = _get_attention(critic_input_nets, 'terrain_height')
         if critic_attention is not None:
             self.writer.add_scalar('Network/attention_terrain_height_critic', torch.abs(critic_attention).mean(), locs['it'])
             self.writer.add_scalar('Network/max_attention_terrain_height_critic', critic_attention.max(), locs['it'])

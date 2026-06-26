@@ -405,12 +405,19 @@ class MultiLinkHeightSensor(RaycastingSensor):
             distances: Ray distances tensor [batch_size, num_links]
             env_ids: Environment IDs being updated
         """
+        # Raycast can return NaN/Inf for misses or numerical edge-cases.
+        # Keep observations finite by mapping invalid values to sensor max range.
+        cleaned = torch.nan_to_num(
+            distances,
+            nan=self.cfg.max_distance,
+            posinf=self.cfg.max_distance,
+            neginf=0.0,
+        )
+
         if self.cfg.use_float:
-            # Store actual distance values
-            self.depth_map[env_ids] = distances
+            self.depth_map[env_ids] = torch.clamp(cleaned, 0.0, self.cfg.max_distance)
         else:
-            # Convert distances to uint8 (0-255 range)
-            heights = torch.clamp(distances / self.cfg.max_distance * 255, 0, 255).to(torch.uint8)
+            heights = torch.clamp(cleaned / self.cfg.max_distance * 255, 0, 255).to(torch.uint8)
             self.depth_map[env_ids] = heights
 
 class DepthCameraSensor(RaycastingSensor):

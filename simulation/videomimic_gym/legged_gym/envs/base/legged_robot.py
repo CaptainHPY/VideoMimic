@@ -182,6 +182,9 @@ class LeggedRobot(BaseTask):
         self.rpy[:] = get_euler_xyz_in_tensor(self.base_quat[:])
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        if not torch.isfinite(self.base_ang_vel[:]).all():
+            print(f"root_states[:, 3:7]: {torch.isfinite(self.root_states[:, 3:7]).all()}")
+            print(f"root_states[:, 10:13]: {torch.isfinite(self.root_states[:, 10:13]).all()}")
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
         self._post_physics_step_callback()
@@ -321,6 +324,10 @@ class LeggedRobot(BaseTask):
             # Add history observations to the observation dictionary
             for key in self.cfg.env.obs_history.keys():
                 self.obs_dict[f'history_{key}'] = self.history_handler.query(key)
+
+        # Expose per-env replay clip index for debugging/logging (not used by policy input heads).
+        if hasattr(self, 'replay_data_loader') and hasattr(self.replay_data_loader, 'episode_indices'):
+            self.obs_dict['clip_index'] = self.replay_data_loader.episode_indices.unsqueeze(1)
 
         self.obs_dict['teacher'] = self._manual_obs_teacher()
         return self.obs_dict
