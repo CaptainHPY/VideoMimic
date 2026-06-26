@@ -4,10 +4,17 @@ from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 import pickle
 import os
+import re
 from typing import Union, List, Optional
 from tqdm import tqdm
 import omegaconf
 from legged_gym.tensor_utils.torch_jit_utils import *
+
+# Process-local cache for clip index -> source file path, used by debugging tools.
+LATEST_CLIP_PATHS = []
+
+# mocap_xia filenames encode style/content/clip indices: style_content_clip.h5
+MOCAP_XIA_CLIP_NAME_RE = re.compile(r'^(?P<style>[A-Za-z]+)_(?P<content>\d+)_(?P<clip>\d+)$')
 
 # TODO document the file format :)
 
@@ -216,6 +223,8 @@ class ReplayDataLoader:
             pkl_paths = list(pkl_paths)
         
         self._pkl_paths = pkl_paths # Store the original list
+        global LATEST_CLIP_PATHS
+        LATEST_CLIP_PATHS = [os.path.abspath(str(p)) for p in pkl_paths]
 
         self._load_data(self._pkl_paths)
 
@@ -242,6 +251,81 @@ class ReplayDataLoader:
     def get_pkl_paths(self) -> List[str]:
         """Returns the original list of pkl/h5 paths used to initialize the loader."""
         return self._pkl_paths
+
+    def _parse_mocap_xia_clip_name(self, pkl_path: str):
+        """Parse mocap_xia clip metadata from a filename.
+
+        The mocap_xia h5 dataset uses filenames like `angry_01_000.h5`, where
+        the first token is the style, the middle token is the content id, and
+        the last token is the clip variant.
+        """
+        clip_name = os.path.splitext(os.path.basename(str(pkl_path)))[0]
+        match = MOCAP_XIA_CLIP_NAME_RE.match(clip_name)
+        if match is None:
+            return None
+
+        return {
+            "clip_name": clip_name,
+            "style_name": match.group("style"),
+            "content_id": int(match.group("content")),
+            "clip_id": int(match.group("clip")),
+        }
+
+    def _pick_alternate_clip_index(self, clip_index: int, relation: str = "style") -> int:
+        """Pick another clip that matches the requested relation.
+
+        Args:
+            clip_index: Index of the reference clip in the loaded clip list.
+            relation: `style` picks the same style but a different content id.
+                `content` picks the same content id but a different style.
+
+        Returns:
+            A different clip index when one exists, otherwise the original index.
+        """
+        if not hasattr(self, "clip_metadata") or clip_index < 0 or clip_index >= len(self.clip_metadata):
+            return clip_index
+
+        clip_meta = self.clip_metadata[clip_index]
+        if clip_meta is None:
+            return clip_index
+
+        if relation == "style":
+            candidate_indices = self.style_to_clip_indices.get(clip_meta["style_name"], [])
+            candidate_indices = [idx for idx in candidate_indices if self.clip_metadata[idx]["content_id"] != clip_meta["content_id"]]
+        elif relation == "content":
+            candidate_indices = self.content_to_clip_indices.get(clip_meta["content_id"], [])
+            candidate_indices = [idx for idx in candidate_indices if self.clip_metadata[idx]["style_name"] != clip_meta["style_name"]]
+        else:
+            raise ValueError(f"Invalid relation: {relation}")
+
+        if not candidate_indices:
+            return clip_index
+
+        return candidate_indices[clip_meta["clip_id"] % len(candidate_indices)]
+
+    def pick_paired_clip_index(self, clip_index: int, relation: str = "style") -> int:
+        """Public wrapper for selecting a paired clip index.
+
+        Args:
+            clip_index: Reference clip index.
+            relation: "style" or "content" pairing rule.
+        """
+        return self._pick_alternate_clip_index(clip_index, relation=relation)
+
+    def get_content_style_clip_splits(self):
+        """Return clip paths ordered by content and style groupings.
+
+        The same mocap_xia dataset can be viewed in two ways:
+        - content ordering: grouped and sorted by content id
+        - style ordering: grouped and sorted by style name
+
+        This mirrors the content/style split used by the stage-3 training code
+        in the video pipeline, while keeping the underlying replay loader API
+        unchanged.
+        """
+        if not hasattr(self, "content_sequence_paths"):
+            return [], []
+        return self.content_sequence_paths, self.style_sequence_paths
 
     def _compute_angular_velocity(self, q1, q0):
         delta_q = quat_mul(q1, quat_conjugate(q0))
@@ -390,9 +474,12 @@ class ReplayDataLoader:
         all_extra_link_quat = []
         all_extra_link_vel = []
         all_extra_link_ang_vel = []
+        clip_metadata = []
 
         current_start_index = 0
         for pkl_idx, pkl_path in enumerate(tqdm(pkl_paths, desc="Loading replay data")):
+            clip_metadata.append(self._parse_mocap_xia_clip_name(pkl_path))
+
             if self.is_csv_joint_only:
                 # Load CSV data
                 data = np.loadtxt(pkl_path, delimiter=',')
@@ -729,6 +816,48 @@ class ReplayDataLoader:
 
         for i, (start_idx, end_idx) in enumerate(zip(self.file_start_indices, self.file_end_indices)):
             self.file_indices[start_idx:end_idx] = i
+
+        # Build mocap_xia-style content/style views when the filename schema is available.
+        self.clip_metadata = clip_metadata
+        self.style_to_clip_indices = {}
+        self.content_to_clip_indices = {}
+        for clip_idx, clip_meta in enumerate(self.clip_metadata):
+            if clip_meta is None:
+                continue
+            self.style_to_clip_indices.setdefault(clip_meta["style_name"], []).append(clip_idx)
+            self.content_to_clip_indices.setdefault(clip_meta["content_id"], []).append(clip_idx)
+
+        self.content_sequence_indices = []
+        self.style_sequence_indices = []
+        for clip_idx, clip_meta in enumerate(self.clip_metadata):
+            if clip_meta is None:
+                continue
+            self.content_sequence_indices.append(clip_idx)
+            self.style_sequence_indices.append(clip_idx)
+
+        if any(meta is not None for meta in self.clip_metadata):
+            self.content_sequence_indices = sorted(
+                self.content_sequence_indices,
+                key=lambda idx: (
+                    self.clip_metadata[idx]["content_id"],
+                    self.clip_metadata[idx]["style_name"],
+                    self.clip_metadata[idx]["clip_id"],
+                ),
+            )
+            self.style_sequence_indices = sorted(
+                self.style_sequence_indices,
+                key=lambda idx: (
+                    self.clip_metadata[idx]["style_name"],
+                    self.clip_metadata[idx]["content_id"],
+                    self.clip_metadata[idx]["clip_id"],
+                ),
+            )
+
+            self.content_sequence_paths = [self._pkl_paths[idx] for idx in self.content_sequence_indices]
+            self.style_sequence_paths = [self._pkl_paths[idx] for idx in self.style_sequence_indices]
+        else:
+            self.content_sequence_paths = list(self._pkl_paths)
+            self.style_sequence_paths = list(self._pkl_paths)
 
     def _precompute_sampling_weights(self):
         """

@@ -96,8 +96,8 @@ class LeggedRobotDeepMimicCfg:
 
     # init_positions_mode = 'replay_data'
     # init_positions_mode = 'default_pos'
-    # init_default_frac = 0.05
-    init_default_frac = 0.0
+    init_default_frac = 0.05
+    # init_default_frac = 0.0
 
     use_amass = True
     amass_replay_data_path = 'lafan_walk_and_dance/*.pkl'
@@ -137,6 +137,13 @@ class LeggedRobotDeepMimicCfg:
 
     human_video_oversample_factor = 1
 
+    # If enabled, the environment exposes a paired style motion stream alongside the content motion stream.
+    use_style_conditioning = False
+    # Training stage: 1 = content-only, 2 = content + style.
+    stage = 1
+    # Pairing rule for style clips when style conditioning is enabled: "style" or "content".
+    style_pair_relation = 'style'
+
 @configclass
 class LeggedRobotDeepMimicTerrainCfg(LeggedRobotTerrainCfg):
     terrain_class = 'DeepMimicTerrain'
@@ -175,8 +182,8 @@ class G1DeepMimicRewardScalesCfg:
 
     lin_vel_z = 0.0
     ang_vel_xy = 0.00
-    orientation = 0.0
-    base_height = 0.0
+    orientation = 1.0
+    base_height = 1.0
     
     # regularisation terms
     dof_acc = 0.0 #-1e-6 / 3.0 
@@ -193,7 +200,7 @@ class G1DeepMimicRewardScalesCfg:
     collision = -15.0
 
     dof_pos_limits = -50.0
-    alive = 0.0
+    alive = 1.0
     hip_pos = 0.0 #-1.0
     # contact_no_vel = -5.0
     contact_no_vel = -100.0
@@ -207,7 +214,7 @@ class G1DeepMimicRewardScalesCfg:
 
     joint_pos_tracking = 120.0
     link_pos_tracking = 30.0
-    root_pos_tracking = 0.0
+    root_pos_tracking = 1.0
     torso_pos_tracking = 15.0
     root_orientation_tracking = 15.0
     torso_orientation_tracking = 15.0
@@ -609,7 +616,7 @@ class G1DeepMimicCfg(LeggedRobotCfg):
 
     env = LeggedRobotEnvCfg(
         num_actions = num_actions,
-        obs = ['torso', 'torso_real', 'deepmimic', 'teacher', 'deepmimic_lin_ang_vel', 'terrain_height', 'terrain_height_noisy', 'root_height', 'phase', 'torso_xy_rel', 'torso_yaw_rel', 'torso_xy', 'torso_yaw', 'target_joints', 'target_root_roll', 'target_root_pitch', 'target_root_yaw', 'upper_body_joint_targets', 'teacher_checkpoint_index'],#, 'depth_camera'],
+        obs = ['torso', 'torso_real', 'deepmimic', 'content_deepmimic', 'style_deepmimic', 'teacher', 'deepmimic_lin_ang_vel', 'terrain_height', 'terrain_height_noisy', 'root_height', 'phase', 'torso_xy_rel', 'torso_yaw_rel', 'torso_xy', 'torso_yaw', 'target_joints', 'target_root_roll', 'target_root_pitch', 'target_root_yaw', 'upper_body_joint_targets', 'teacher_checkpoint_index'],#, 'depth_camera'],
         obs_history = {
             'torso_real': 5,
             'torso_xy_rel': 5,
@@ -717,6 +724,10 @@ class G1DeepMimicMocapCfg(G1DeepMimicCfg):
 @configclass
 class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
     init_noise_std = 0.8
+    stage = 1
+    freeze_style_branch = False
+    style_lr_scale = 0.1
+    style_lr_warmup_steps = 5000
 
     @configclass
     class ObsProcActor:
@@ -730,6 +741,8 @@ class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
         target_joints = {'type': 'identity'}
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}
+        style_deepmimic = {'type': 'identity'}
         # target_root_yaw = {'type': 'flatten'}
 
         # history_torso_xy = {'type': 'flatten'}
@@ -753,8 +766,8 @@ class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
         history_torso_real = {'type': 'flatten'}
         history_torso_xy_rel = {'type': 'flatten'}
         history_torso_yaw_rel = {'type': 'flatten'}
-
-        target_joints = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}  # Added content deepmimic
+        style_deepmimic = {'type': 'identity'}    # Added style deepmimic
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
 
@@ -788,8 +801,8 @@ class G1DeepmimicHeightFieldPolicyCfg(G1DeepMimicPolicyCfg):
         # # history_deepmimic_lin_ang_vel = {'type': 'flatten'}
         history_torso_xy_rel = {'type': 'flatten'}
         history_torso_yaw_rel = {'type': 'flatten'}
-
-        target_joints = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}  # Added content deepmimic
+        style_deepmimic = {'type': 'identity'}    # Added style deepmimic
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
 
@@ -819,6 +832,8 @@ class G1DeepmimicHeightFieldPolicyCfg(G1DeepMimicPolicyCfg):
         target_joints = {'type': 'identity'}
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}
+        style_deepmimic = {'type': 'identity'}
 
         # target_root_yaw = {'type': 'flatten'}
         # history_torso_xy = {'type': 'flatten'}
@@ -933,6 +948,8 @@ class G1DeepMimicCfgRootHeightfieldPolicyCfg(G1DeepMimicPolicyCfg):
         # target_joints = {'type': 'identity'}
         # target_root_roll = {'type': 'identity'}
         # target_root_pitch = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}
+        style_deepmimic = {'type': 'identity'}
 
         # terrain_height = { 'type': 'flatten_then_embed_with_attention' , 'output_dim': 415}
         # terrain_height = { 'type': 'flatten_then_embed_with_attention' , 'output_dim': 401}
@@ -950,6 +967,8 @@ class G1DeepMimicCfgRootHeightfieldPolicyCfg(G1DeepMimicPolicyCfg):
         target_joints = {'type': 'identity'}
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}
+        style_deepmimic = {'type': 'identity'}
 
         # target_root_yaw = {'type': 'flatten'}
         # history_torso_xy = {'type': 'flatten'}
@@ -1018,6 +1037,8 @@ class G1DeepMimicCfgRootHeightfieldNoHistoryPolicyCfg(G1DeepMimicPolicyCfg):
         target_joints = {'type': 'identity'}
         target_root_roll = {'type': 'identity'}
         target_root_pitch = {'type': 'identity'}
+        content_deepmimic = {'type': 'identity'}
+        style_deepmimic = {'type': 'identity'}
 
         # target_root_yaw = {'type': 'flatten'}
         # history_torso_xy = {'type': 'flatten'}

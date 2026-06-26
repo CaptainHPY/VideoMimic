@@ -84,7 +84,10 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None # initialized later
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+        if hasattr(self.actor_critic, "get_optimizer_param_groups"):
+            self.optimizer = optim.Adam(self.actor_critic.get_optimizer_param_groups(learning_rate))
+        else:
+            self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -118,9 +121,21 @@ class PPO:
                 self.load_teachers(self.policy_to_clone)
             else:
                 self.bc_policy = self.load_policy_to_clone(self.policy_to_clone)
-            self.bc_policy_loaded = True
-        elif self.bc_loss_coef > 0.0 or self.switch_to_rl_after > 0 and self.policy_to_clone is None:
+                self.bc_policy_loaded = True
+        elif (self.bc_loss_coef > 0.0 or self.switch_to_rl_after > 0) and self.policy_to_clone is None:
             raise ValueError('policy_to_clone must be provided if bc_loss_coef > 0.0')
+
+    def _sync_optimizer_learning_rates(self, current_learning_iteration):
+        style_lr_scale = 1.0
+        if hasattr(self.actor_critic, "get_style_lr_scale"):
+            style_lr_scale = self.actor_critic.get_style_lr_scale(current_learning_iteration)
+
+        for param_group in self.optimizer.param_groups:
+            group_name = param_group.get("name", "")
+            if group_name == "style":
+                param_group["lr"] = self.learning_rate * style_lr_scale
+            else:
+                param_group["lr"] = self.learning_rate
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_shapes, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, obs_shapes, action_shape, has_teacher_actions=self.has_teacher_actions, device=self.device)
@@ -188,6 +203,7 @@ class PPO:
         mean_surrogate_loss = 0
         mean_bc_loss = 0
         mean_bounds_loss = 0
+        self._sync_optimizer_learning_rates(current_learning_iteration)
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -233,14 +249,14 @@ class PPO:
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * factor)
 
+                        self._sync_optimizer_learning_rates(current_learning_iteration)
+
                     # broadcast computed learning rate from process 0 (where calculation took place) to the rest 
                     if self.multi_gpu:
                         learning_rate_tensor = torch.tensor([self.learning_rate], device=self.device)
                         dist.broadcast(learning_rate_tensor, 0)
                         self.learning_rate = learning_rate_tensor.item()
-
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.learning_rate
+                        self._sync_optimizer_learning_rates(current_learning_iteration)
 
 
                 # Surrogate loss
@@ -294,6 +310,10 @@ class PPO:
                     + self.bc_loss_coef * bc_loss \
                     + self.bounds_loss_coef * bounds_loss
 
+                if not torch.isfinite(loss):
+                    print("[PPO] Non-finite loss detected; skipping optimizer step for this mini-batch.")
+                    continue
+
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -317,8 +337,28 @@ class PPO:
                             )
                             offset += param.numel()
 
+                has_nonfinite_grad = False
+                for param in self.actor_critic.parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        has_nonfinite_grad = True
+                        break
+
+                if has_nonfinite_grad:
+                    print("[PPO] Non-finite gradient detected; skipping optimizer step for this mini-batch.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+
+                # Protect action std from NaN/Inf pollution in long runs.
+                with torch.no_grad():
+                    if hasattr(self.actor_critic, 'std'):
+                        std = self.actor_critic.std.data
+                        if not torch.isfinite(std).all():
+                            print("[PPO] actor_critic.std became non-finite; resetting invalid entries to 1.0.")
+                            std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
+                        self.actor_critic.std.data.copy_(std.clamp_(1e-3, 10.0))
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
