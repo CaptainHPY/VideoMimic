@@ -48,6 +48,7 @@ class RolloutStorage:
             self.hidden_states = None
             self.teacher_actions = None
             self.teacher_values = None
+            self.discriminator_observations = None
 
         def clear(self):
             self.__init__()
@@ -93,8 +94,21 @@ class RolloutStorage:
         # rnn
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
+        self.discriminator_observations = None
 
         self.step = 0
+
+    def _init_discriminator_storage(self, discriminator_observations):
+        self.discriminator_observations = {
+            key: torch.zeros(
+                self.num_transitions_per_env,
+                self.num_envs,
+                *value.shape[1:],
+                device=self.device,
+                dtype=value.dtype,
+            )
+            for key, value in discriminator_observations.items()
+        }
 
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
@@ -114,6 +128,11 @@ class RolloutStorage:
         if self.has_teacher_actions:
             self.teacher_actions[self.step].copy_(transition.teacher_actions)
             self.teacher_values[self.step].copy_(transition.teacher_values)
+        if transition.discriminator_observations is not None:
+            if self.discriminator_observations is None:
+                self._init_discriminator_storage(transition.discriminator_observations)
+            for key, value in transition.discriminator_observations.items():
+                self.discriminator_observations[key][self.step].copy_(value)
         
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
@@ -167,6 +186,29 @@ class RolloutStorage:
         )
         trajectory_lengths = done_indices[1:] - done_indices[:-1]
         return trajectory_lengths.float().mean(), self.rewards.mean()
+
+    def get_discriminator_sequences(self, sequence_length):
+        if self.discriminator_observations is None:
+            return None
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        if sequence_length > self.num_transitions_per_env:
+            raise ValueError(
+                f"sequence_length={sequence_length} exceeds rollout length={self.num_transitions_per_env}"
+            )
+
+        sequences = {}
+        for key, values in self.discriminator_observations.items():
+            windows = []
+            for start in range(self.num_transitions_per_env - sequence_length + 1):
+                windows.append(values[start:start + sequence_length].transpose(0, 1))
+            sequences[key] = torch.cat(windows, dim=0)
+
+        done_windows = []
+        for start in range(self.num_transitions_per_env - sequence_length + 1):
+            done_windows.append(self.dones[start:start + sequence_length].transpose(0, 1))
+        sequences["padding_mask"] = torch.cat(done_windows, dim=0).squeeze(-1).bool()
+        return sequences
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         batch_size = self.num_envs * self.num_transitions_per_env

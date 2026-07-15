@@ -156,8 +156,62 @@ class RobotDeepMimic(LeggedRobot):
                 print(f"[DeepMimic] Non-finite values detected in {name} for envs: {bad_envs.tolist()}")
             obs = self._finite_tensor(obs)
         return obs
-        
-    
+
+    def _build_discriminator_motion_state(self, root_pos, root_quat, motor_pos, motor_vel, name):
+        motion_state = torch.cat((
+            root_pos,
+            self._safe_quat(root_quat),
+            motor_pos,
+            motor_vel,
+        ), dim=-1)
+        return self._validate_obs_tensor(motion_state, name)
+
+    def _get_discriminator_reference_field(self, prefix, field_name):
+        value = getattr(self, f"{prefix}_target_{field_name}", None)
+        if value is None:
+            value = getattr(self, f"content_target_{field_name}", None)
+        return value
+
+    def _build_discriminator_observations(self):
+        generated_motion = self._build_discriminator_motion_state(
+            self.env_root_pos,
+            self.root_states[:, 3:7],
+            self.dof_pos,
+            self.dof_vel,
+            "discriminator_generated_motion",
+        )
+
+        content_motion = self._build_discriminator_motion_state(
+            self.content_target_root_pos,
+            self.content_target_root_quat,
+            self.content_target_motors,
+            self.content_target_motor_vels,
+            "discriminator_content_motion",
+        )
+
+        style_motion = self._build_discriminator_motion_state(
+            self._get_discriminator_reference_field("style", "root_pos"),
+            self._get_discriminator_reference_field("style", "root_quat"),
+            self._get_discriminator_reference_field("style", "motors"),
+            self._get_discriminator_reference_field("style", "motor_vels"),
+            "discriminator_style_motion",
+        )
+
+        return {
+            "generated_motion": generated_motion.detach(),
+            "content_motion": content_motion.detach(),
+            "style_motion": style_motion.detach(),
+            "content_condition": self.obs_dict.get("content_deepmimic", self.obs_dict.get("deepmimic")).detach(),
+            "style_condition": self.obs_dict.get("style_deepmimic", self.obs_dict.get("deepmimic")).detach(),
+            "valid_mask": (~self.reset_buf).float().unsqueeze(-1).detach(),
+        }
+
+    def compute_observations(self):
+        obs = super().compute_observations()
+        self.extras["discriminator"] = self._build_discriminator_observations()
+        return obs
+	        
+	    
     """Helper functions to convert between env and world frames (because of the terrain offsets.)"""
 
     @property
