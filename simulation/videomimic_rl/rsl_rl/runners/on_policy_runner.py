@@ -30,6 +30,7 @@
 
 import time
 import os
+import json
 from collections import deque
 import statistics
 
@@ -128,6 +129,7 @@ class OnPolicyRunner:
         self.console_ep_log_exclude = set(self.cfg.get("console_ep_log_exclude", []))
         self.console_ep_log_max_items = int(self.cfg.get("console_ep_log_max_items", 6))
         self.console_ep_log_sort = self.cfg.get("console_ep_log_sort", "name")
+        self.decoder_gate_log_path = os.path.join(self.log_dir, "decoder_gate_log.json") if self.log_dir is not None else None
 
         _ = self.env.reset()
 
@@ -200,6 +202,7 @@ class OnPolicyRunner:
                 self.alg.compute_returns(obs)
             
             mean_value_loss, mean_surrogate_loss, mean_bc_loss, mean_bounds_loss = self.alg.update(it)
+            self.log_decoder_gates(it)
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -210,6 +213,49 @@ class OnPolicyRunner:
         
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    def log_decoder_gates(self, iteration):
+        if self.disable_logs or self.decoder_gate_log_path is None:
+            return
+        if not hasattr(self.alg.actor_critic, "get_decoder_gate_values"):
+            return
+
+        gate_values = self.alg.actor_critic.get_decoder_gate_values()
+        if len(gate_values) == 0:
+            return
+
+        record = {
+            "iteration": int(iteration),
+            "gates": gate_values,
+        }
+        self._append_json_record(self.decoder_gate_log_path, record)
+
+    @staticmethod
+    def _append_json_record(path, record):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        encoded_record = json.dumps(record, sort_keys=True)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            with open(path, "w") as f:
+                f.write("[\n")
+                f.write(encoded_record)
+                f.write("\n]\n")
+            return
+
+        with open(path, "rb+") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            while pos > 0:
+                pos -= 1
+                f.seek(pos)
+                if not f.read(1).isspace():
+                    break
+            f.seek(pos)
+            if f.read(1) != b"]":
+                raise ValueError(f"Cannot append decoder gate record: {path} is not a JSON array")
+            f.seek(pos)
+            f.write(b",\n")
+            f.write(encoded_record.encode("utf-8"))
+            f.write(b"\n]\n")
 
     def log(self, locs, width=80, pad=35):
 

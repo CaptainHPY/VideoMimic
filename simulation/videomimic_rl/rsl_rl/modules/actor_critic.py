@@ -191,7 +191,7 @@ class StyleTransformer(nn.Module):
     separately before modulation, matching the content/style split used in
     class.py.
     """
-    def __init__(self, input_dim, num_parts=6, part_dim=None, num_enc_layers=2, num_dec_layers=2, num_heads=4):
+    def __init__(self, input_dim, num_parts=6, part_dim=None, num_enc_layers=2, num_dec_layers=3, num_heads=4):
         super().__init__()
         self.input_dim = input_dim
         self.num_parts = num_parts
@@ -212,6 +212,7 @@ class StyleTransformer(nn.Module):
         # decoder query and motion decoder used to generate the style-transferred motion tokens
         self.decoder_query = nn.Parameter(torch.randn(num_parts, part_dim))
         self.decoder = TransformerDecoder(part_dim, num_heads=num_heads, num_layers=num_dec_layers, num_parts=num_parts)
+        self.content_decoder_gate = nn.Parameter(torch.tensor(-4.0))
 
         # learnable style tokens, one token per body part, matching class.py
         self.learnable_style_token = nn.Parameter(torch.randn(1, num_parts, part_dim))
@@ -252,7 +253,9 @@ class StyleTransformer(nn.Module):
             content_style_signal = cnt_enc_IN.reshape(B, -1)
             generated_tokens = decode_tokens(cnt_enc_IN, content_style_signal)
             generated_motion = self.motion_proj(generated_tokens.reshape(B, -1))
-            return self.out_proj(generated_motion)
+            generated_feature = self.out_proj(generated_motion)
+            decoder_gate = torch.sigmoid(self.content_decoder_gate)
+            return cnt + decoder_gate * generated_feature
 
         sty_enc_IN = encode_stream(sty, add_style_token=True)
         sty_of_sty_enc = sty_enc_IN[:, :style_token_count, :]
@@ -394,14 +397,14 @@ class ActorCritic(nn.Module):
                         style_num_parts=6,
                         style_part_dim=None,
                         style_num_enc_layers=2,
-                        style_num_dec_layers=2,
+                        style_num_dec_layers=3,
                         style_num_heads=4,
                         **kwargs):
         if kwargs:
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
         super(ActorCritic, self).__init__()
 
-        activation = get_activation(activation)
+        activation_name = activation
 
         # For activation monitoring
         self.activation_hooks = []
@@ -471,15 +474,31 @@ class ActorCritic(nn.Module):
         mlp_input_dim_a = sum(self.actor_stream_dims.values())
         mlp_input_dim_c = sum(self.critic_stream_dims.values())
 
-        # Policy heads: features are produced by stream-specific StyleBackbones.
+        def _make_activation():
+            return get_activation(activation_name)
+
+        def _build_mlp(input_dim, hidden_dims, output_dim):
+            layers = []
+            last_dim = input_dim
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(last_dim, hidden_dim))
+                if layer_norm:
+                    layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(_make_activation())
+                last_dim = hidden_dim
+            layers.append(nn.Linear(last_dim, output_dim))
+            return SequentialWithExtraProj(*layers)
+
+        # Policy heads: features are produced by stream-specific StyleBackbones,
+        # then decoded by configurable MLP actor/critic heads.
         self.num_actions = num_actions
-        self.actor = nn.Linear(mlp_input_dim_a, num_actions)
-        self.critic = nn.Linear(mlp_input_dim_c, 1)
+        self.actor = _build_mlp(mlp_input_dim_a, actor_hidden_dims, num_actions)
+        self.critic = _build_mlp(mlp_input_dim_c, critic_hidden_dims, 1)
 
         self._apply_stage_freeze()
 
-        print(f"Actor MLP: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        print(f"Actor network:\nInput/backbone streams: {self.actor_stream_modules}\nMLP head: {self.actor}")
+        print(f"Critic network:\nInput/backbone streams: {self.critic_stream_modules}\nMLP head: {self.critic}")
 
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
@@ -493,7 +512,14 @@ class ActorCritic(nn.Module):
         # self.init_memory_weights(self.memory_c, 0.001, 0.)
 
     def _is_generation_param_name(self, name: str) -> bool:
-        return any(token in name for token in ["style_", ".decoder", ".decoder_query", ".modulator", ".adain", ".learnable_style_token", ".cross_attn"])
+        style_stream_prefixes = (
+            "actor_stream_modules.actor_style_",
+            "critic_stream_modules.critic_style_",
+        )
+        generation_modules = (
+            ".modulator.",
+        )
+        return name.startswith(style_stream_prefixes) or any(module_name in name for module_name in generation_modules)
 
     def _apply_stage_freeze(self):
         freeze_generation = self.stage == 1 or self._freeze_style_branch_override
@@ -515,6 +541,20 @@ class ActorCritic(nn.Module):
         if current_learning_iteration < self.style_lr_warmup_steps:
             return self.style_lr_scale
         return 1.0
+
+    def get_decoder_gate_values(self) -> Dict[str, Dict[str, float]]:
+        gate_values = {}
+        with torch.no_grad():
+            for module_name, module in self.named_modules():
+                if not isinstance(module, StyleTransformer):
+                    continue
+                raw_gate = module.content_decoder_gate.detach()
+                gate_values[module_name] = {
+                    "raw": float(raw_gate.item()),
+                    "sigmoid": float(torch.sigmoid(raw_gate).item()),
+                    "requires_grad": bool(module.content_decoder_gate.requires_grad),
+                }
+        return gate_values
 
     def get_optimizer_param_groups(self, base_lr: float):
         generation_params = []
