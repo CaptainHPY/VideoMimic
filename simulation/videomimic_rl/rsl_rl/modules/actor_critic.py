@@ -225,6 +225,30 @@ class StyleTransformer(nn.Module):
 
         # final proj
         self.out_proj = nn.Linear(input_dim, input_dim)
+        self._generated_feature_contrib_sum = None
+        self._generated_feature_contrib_count = 0
+
+    def _record_generated_feature_contribution(self, weighted_generated_feature, output):
+        with torch.no_grad():
+            denominator = output.norm(p=2, dim=-1).clamp_min(1e-8)
+            contribution = (weighted_generated_feature.norm(p=2, dim=-1) / denominator).mean().detach()
+            if self._generated_feature_contrib_sum is None:
+                self._generated_feature_contrib_sum = contribution
+            else:
+                self._generated_feature_contrib_sum = self._generated_feature_contrib_sum + contribution
+            self._generated_feature_contrib_count += 1
+
+    def get_and_reset_generated_feature_contribution(self):
+        if self._generated_feature_contrib_count == 0 or self._generated_feature_contrib_sum is None:
+            return None
+        contribution = self._generated_feature_contrib_sum / self._generated_feature_contrib_count
+        stats = {
+            "contribution_ratio": float(contribution.item()),
+            "num_forwards": int(self._generated_feature_contrib_count),
+        }
+        self._generated_feature_contrib_sum = None
+        self._generated_feature_contrib_count = 0
+        return stats
 
     def forward(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
         # cnt/sty: (B, input_dim)
@@ -255,7 +279,10 @@ class StyleTransformer(nn.Module):
             generated_motion = self.motion_proj(generated_tokens.reshape(B, -1))
             generated_feature = self.out_proj(generated_motion)
             decoder_gate = torch.sigmoid(self.content_decoder_gate)
-            return cnt + decoder_gate * generated_feature
+            weighted_generated_feature = decoder_gate * generated_feature
+            output = cnt + weighted_generated_feature
+            self._record_generated_feature_contribution(weighted_generated_feature, output)
+            return output
 
         sty_enc_IN = encode_stream(sty, add_style_token=True)
         sty_of_sty_enc = sty_enc_IN[:, :style_token_count, :]
@@ -542,19 +569,17 @@ class ActorCritic(nn.Module):
             return self.style_lr_scale
         return 1.0
 
-    def get_decoder_gate_values(self) -> Dict[str, Dict[str, float]]:
-        gate_values = {}
-        with torch.no_grad():
-            for module_name, module in self.named_modules():
-                if not isinstance(module, StyleTransformer):
+    def get_and_reset_generated_feature_contribution_stats(self) -> Dict[str, Dict[str, float]]:
+        stats = {}
+        for module_name, module in self.named_modules():
+            if not isinstance(module, StyleTransformer):
+                continue
+            module_stats = module.get_and_reset_generated_feature_contribution()
+            if module_stats is not None:
+                if not self.use_style_stream and "style_backbone" in module_name:
                     continue
-                raw_gate = module.content_decoder_gate.detach()
-                gate_values[module_name] = {
-                    "raw": float(raw_gate.item()),
-                    "sigmoid": float(torch.sigmoid(raw_gate).item()),
-                    "requires_grad": bool(module.content_decoder_gate.requires_grad),
-                }
-        return gate_values
+                stats[module_name] = module_stats
+        return stats
 
     def get_optimizer_param_groups(self, base_lr: float):
         generation_params = []

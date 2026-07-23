@@ -30,7 +30,6 @@
 
 import time
 import os
-import json
 from collections import deque
 import statistics
 
@@ -129,7 +128,6 @@ class OnPolicyRunner:
         self.console_ep_log_exclude = set(self.cfg.get("console_ep_log_exclude", []))
         self.console_ep_log_max_items = int(self.cfg.get("console_ep_log_max_items", 6))
         self.console_ep_log_sort = self.cfg.get("console_ep_log_sort", "name")
-        self.decoder_gate_log_path = os.path.join(self.log_dir, "decoder_gate_log.json") if self.log_dir is not None else None
 
         _ = self.env.reset()
 
@@ -138,7 +136,6 @@ class OnPolicyRunner:
         # initialize writer
         if self.cfg['use_wandb'] and not self.disable_logs:
             import wandb
-            wandb.tensorboard.patch(root_logdir=self.log_dir)
             wandb.init(project="rsl_rl", config=self.cfg, name=self.cfg['run_name'], notes=self.cfg['wandb_note'] if 'wandb_note' in self.cfg else '', entity=self.cfg['wandb_entity'] if 'wandb_entity' in self.cfg else None)
             # Start tensorboard logging
 
@@ -197,12 +194,11 @@ class OnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
 
-                # Learning step
-                start = stop
-                self.alg.compute_returns(obs)
+            # Learning step
+            start = stop
+            self.alg.compute_returns(obs)
             
             mean_value_loss, mean_surrogate_loss, mean_bc_loss, mean_bounds_loss = self.alg.update(it)
-            self.log_decoder_gates(it)
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -213,49 +209,6 @@ class OnPolicyRunner:
         
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
-
-    def log_decoder_gates(self, iteration):
-        if self.disable_logs or self.decoder_gate_log_path is None:
-            return
-        if not hasattr(self.alg.actor_critic, "get_decoder_gate_values"):
-            return
-
-        gate_values = self.alg.actor_critic.get_decoder_gate_values()
-        if len(gate_values) == 0:
-            return
-
-        record = {
-            "iteration": int(iteration),
-            "gates": gate_values,
-        }
-        self._append_json_record(self.decoder_gate_log_path, record)
-
-    @staticmethod
-    def _append_json_record(path, record):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        encoded_record = json.dumps(record, sort_keys=True)
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            with open(path, "w") as f:
-                f.write("[\n")
-                f.write(encoded_record)
-                f.write("\n]\n")
-            return
-
-        with open(path, "rb+") as f:
-            f.seek(0, os.SEEK_END)
-            pos = f.tell()
-            while pos > 0:
-                pos -= 1
-                f.seek(pos)
-                if not f.read(1).isspace():
-                    break
-            f.seek(pos)
-            if f.read(1) != b"]":
-                raise ValueError(f"Cannot append decoder gate record: {path} is not a JSON array")
-            f.seek(pos)
-            f.write(b",\n")
-            f.write(encoded_record.encode("utf-8"))
-            f.write(b"\n]\n")
 
     def log(self, locs, width=80, pad=35):
 
@@ -270,6 +223,14 @@ class OnPolicyRunner:
         self.tot_timesteps += collection_size
         self.tot_time += locs['collection_time'] + locs['learn_time']
         iteration_time = locs['collection_time'] + locs['learn_time']
+        wandb_metrics = {}
+
+        def add_scalar(key, value, step):
+            self.writer.add_scalar(key, value, step)
+            if self.cfg['use_wandb']:
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().mean().item()
+                wandb_metrics[key] = value
 
         ep_string = f''
         if locs['ep_infos']:
@@ -288,7 +249,7 @@ class OnPolicyRunner:
                             ep_info[key] = ep_info[key].unsqueeze(0)
                         infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
-                self.writer.add_scalar(key, value, locs['it'])
+                add_scalar(key, value, locs['it'])
                 ep_means[key] = value.item()
 
             if self.console_ep_log:
@@ -320,21 +281,33 @@ class OnPolicyRunner:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar('learning_iteration', locs['it'], locs['it'])
-        self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
-        self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
-        self.writer.add_scalar('Loss/bc', locs['mean_bc_loss'], locs['it'])
-        self.writer.add_scalar('Loss/bounds', locs['mean_bounds_loss'], locs['it'])
-        self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
-        self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
-        self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
-        self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
-        self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        add_scalar('learning_iteration', locs['it'], locs['it'])
+        add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
+        add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
+        add_scalar('Loss/bc', locs['mean_bc_loss'], locs['it'])
+        add_scalar('Loss/bounds', locs['mean_bounds_loss'], locs['it'])
+        add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
+        discriminator_stats = getattr(self.alg, "last_discriminator_stats", {})
+        for key, value in discriminator_stats.items():
+            add_scalar(f'Discriminator/{key}', value, locs['it'])
+        add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
+        add_scalar('Perf/total_fps', fps, locs['it'])
+        add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
+        add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        if hasattr(self.alg.actor_critic, "get_and_reset_generated_feature_contribution_stats"):
+            contribution_stats = self.alg.actor_critic.get_and_reset_generated_feature_contribution_stats()
+            contribution_values = []
+            for module_name, stats in contribution_stats.items():
+                contribution_values.append(stats['contribution_ratio'])
+                add_scalar(f'Network/generated_feature_contribution/{module_name}', stats['contribution_ratio'], locs['it'])
+                add_scalar(f'Network/generated_feature_contribution_forwards/{module_name}', stats['num_forwards'], locs['it'])
+            if len(contribution_values) > 0:
+                add_scalar('Network/generated_feature_contribution_mean', sum(contribution_values) / len(contribution_values), locs['it'])
         if len(locs['rewbuffer']) > 0:
-            self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
-            self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
-            self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
-            self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
+            add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
+            add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
+            add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
+            add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
 
 
         actor_attention = None
@@ -361,13 +334,17 @@ class OnPolicyRunner:
 
         actor_attention = _get_attention(actor_input_nets, 'terrain_height')
         if actor_attention is not None:
-            self.writer.add_scalar('Network/attention_terrain_height_actor', torch.abs(actor_attention).mean(), locs['it'])
-            self.writer.add_scalar('Network/max_attention_terrain_height_actor', actor_attention.max(), locs['it'])
+            add_scalar('Network/attention_terrain_height_actor', torch.abs(actor_attention).mean(), locs['it'])
+            add_scalar('Network/max_attention_terrain_height_actor', actor_attention.max(), locs['it'])
 
         critic_attention = _get_attention(critic_input_nets, 'terrain_height')
         if critic_attention is not None:
-            self.writer.add_scalar('Network/attention_terrain_height_critic', torch.abs(critic_attention).mean(), locs['it'])
-            self.writer.add_scalar('Network/max_attention_terrain_height_critic', critic_attention.max(), locs['it'])
+            add_scalar('Network/attention_terrain_height_critic', torch.abs(critic_attention).mean(), locs['it'])
+            add_scalar('Network/max_attention_terrain_height_critic', critic_attention.max(), locs['it'])
+
+        if self.cfg['use_wandb'] and len(wandb_metrics) > 0:
+            import wandb
+            wandb.log(wandb_metrics, step=locs['it'])
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
@@ -406,13 +383,18 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path, infos=None):
-        torch.save({
+        checkpoint = {
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'policy_cfg': self.policy_cfg,
             'infos': infos,
-            }, path)
+            }
+        if getattr(self.alg, "discriminator", None) is not None:
+            checkpoint['discriminator_state_dict'] = self.alg.discriminator.state_dict()
+        if getattr(self.alg, "discriminator_optimizer", None) is not None:
+            checkpoint['discriminator_optimizer_state_dict'] = self.alg.discriminator_optimizer.state_dict()
+        torch.save(checkpoint, path)
         if self.cfg['use_wandb'] and not self.disable_logs:
             import wandb
             wandb.save(path)
@@ -427,6 +409,14 @@ class OnPolicyRunner:
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'], strict=self.load_model_strict)
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+        if 'discriminator_state_dict' in loaded_dict and hasattr(self.alg, "load_discriminator_state_dict"):
+            discriminator_optimizer_state_dict = (
+                loaded_dict.get('discriminator_optimizer_state_dict', None) if load_optimizer else None
+            )
+            self.alg.load_discriminator_state_dict(
+                loaded_dict['discriminator_state_dict'],
+                discriminator_optimizer_state_dict,
+            )
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
 
