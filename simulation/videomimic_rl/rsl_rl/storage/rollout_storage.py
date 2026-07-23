@@ -210,6 +210,19 @@ class RolloutStorage:
         sequences["padding_mask"] = torch.cat(done_windows, dim=0).squeeze(-1).bool()
         return sequences
 
+    def add_discriminator_sequence_rewards(self, sequence_rewards, sequence_length):
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        expected_num_sequences = (self.num_transitions_per_env - sequence_length + 1) * self.num_envs
+        if sequence_rewards.numel() != expected_num_sequences:
+            raise ValueError(
+                f"Expected {expected_num_sequences} discriminator rewards, got {sequence_rewards.numel()}"
+            )
+
+        reward_windows = sequence_rewards.view(self.num_transitions_per_env - sequence_length + 1, self.num_envs, 1)
+        for start in range(self.num_transitions_per_env - sequence_length + 1):
+            self.rewards[start + sequence_length - 1] += reward_windows[start]
+
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches

@@ -197,7 +197,7 @@ class RobotDeepMimic(LeggedRobot):
             "discriminator_style_motion",
         )
 
-        return {
+        discriminator_obs = {
             "generated_motion": generated_motion.detach(),
             "content_motion": content_motion.detach(),
             "style_motion": style_motion.detach(),
@@ -205,6 +205,21 @@ class RobotDeepMimic(LeggedRobot):
             "style_condition": self.obs_dict.get("style_deepmimic", self.obs_dict.get("deepmimic")).detach(),
             "valid_mask": (~self.reset_buf).float().unsqueeze(-1).detach(),
         }
+
+        if hasattr(self, "feet_indices"):
+            discriminator_obs["generated_feet_pos"] = self.env_rigid_body_pos[:, self.feet_indices].detach()
+
+        content_contacts = getattr(self, "content_target_contacts", None)
+        if content_contacts is not None:
+            discriminator_obs["content_contact"] = content_contacts.detach().float()
+
+        style_contacts = getattr(self, "style_target_contacts", None)
+        if style_contacts is None:
+            style_contacts = content_contacts
+        if style_contacts is not None:
+            discriminator_obs["style_contact"] = style_contacts.detach().float()
+
+        return discriminator_obs
 
     def compute_observations(self):
         obs = super().compute_observations()

@@ -1266,6 +1266,26 @@ class G1DeepMimicAlgorithmCfg(LeggedRobotAlgorithmCfg):
     use_multi_teacher: bool = False
     multi_teacher_select_obs_var: str = 'teacher_checkpoint_index'
 
+    # Optional stage-2 style-transfer adversarial training. Kept disabled by
+    # default so stage-1 checkpoints and training behavior remain unchanged.
+    use_discriminator: bool = False
+    discriminator_sequence_length: int = 8
+    discriminator_hidden_dim: int = 256
+    discriminator_num_heads: int = 4
+    discriminator_num_layers: int = 2
+    discriminator_learning_rate: float = 1.e-4
+    discriminator_updates_per_iter: int = 1
+    discriminator_r1_coef: float = 10.0
+    discriminator_reward_coef: float = 0.0
+    discriminator_recon_coef: float = 0.0
+    discriminator_content_coef: float = 0.0
+    discriminator_cycle_content_coef: float = 0.0
+    discriminator_cycle_style_coef: float = 0.0
+    discriminator_smoothness_coef: float = 0.0
+    discriminator_accel_coef: float = 0.0
+    discriminator_contact_coef: float = 0.0
+    discriminator_max_sequence_length: int = 64
+
 @configclass
 class G1DeepMimicCfgPPO(LeggedRobotCfgPPO):
     policy = G1DeepMimicPolicyCfg()

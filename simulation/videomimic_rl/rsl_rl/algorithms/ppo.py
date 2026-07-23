@@ -33,8 +33,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import os
+import torch.nn.functional as F
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, MotionStyleDiscriminator
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils.jit import try_load_jit_model
 
@@ -69,6 +70,23 @@ class PPO:
         use_multi_teacher=False,
         multi_teacher_select_obs_var='teacher_checkpoint_index',
         switch_to_rl_after=-1,
+        use_discriminator=False,
+        discriminator_sequence_length=8,
+        discriminator_hidden_dim=256,
+        discriminator_num_heads=4,
+        discriminator_num_layers=2,
+        discriminator_learning_rate=None,
+        discriminator_updates_per_iter=1,
+        discriminator_r1_coef=10.0,
+        discriminator_reward_coef=0.0,
+        discriminator_recon_coef=0.0,
+        discriminator_content_coef=0.0,
+        discriminator_cycle_content_coef=0.0,
+        discriminator_cycle_style_coef=0.0,
+        discriminator_smoothness_coef=0.0,
+        discriminator_accel_coef=0.0,
+        discriminator_contact_coef=0.0,
+        discriminator_max_sequence_length=64,
     ):
 
         self.device = device
@@ -115,6 +133,27 @@ class PPO:
         self.use_multi_teacher = use_multi_teacher
         self.multi_teacher_select_obs_var = multi_teacher_select_obs_var
         self.switch_to_rl_after = switch_to_rl_after
+
+        self.use_discriminator = bool(use_discriminator)
+        self.discriminator_sequence_length = int(discriminator_sequence_length)
+        self.discriminator_hidden_dim = int(discriminator_hidden_dim)
+        self.discriminator_num_heads = int(discriminator_num_heads)
+        self.discriminator_num_layers = int(discriminator_num_layers)
+        self.discriminator_learning_rate = learning_rate if discriminator_learning_rate is None else discriminator_learning_rate
+        self.discriminator_updates_per_iter = int(discriminator_updates_per_iter)
+        self.discriminator_r1_coef = float(discriminator_r1_coef)
+        self.discriminator_reward_coef = float(discriminator_reward_coef)
+        self.discriminator_recon_coef = float(discriminator_recon_coef)
+        self.discriminator_content_coef = float(discriminator_content_coef)
+        self.discriminator_cycle_content_coef = float(discriminator_cycle_content_coef)
+        self.discriminator_cycle_style_coef = float(discriminator_cycle_style_coef)
+        self.discriminator_smoothness_coef = float(discriminator_smoothness_coef)
+        self.discriminator_accel_coef = float(discriminator_accel_coef)
+        self.discriminator_contact_coef = float(discriminator_contact_coef)
+        self.discriminator_max_sequence_length = int(discriminator_max_sequence_length)
+        self.discriminator = None
+        self.discriminator_optimizer = None
+        self.last_discriminator_stats = {}
 
         if self.bc_loss_coef > 0.0 or self.switch_to_rl_after > 0 and self.policy_to_clone is not None:
             if self.use_multi_teacher:
@@ -195,8 +234,250 @@ class PPO:
 
     
     def compute_returns(self, last_obs):
-        last_values= self.actor_critic.evaluate(last_obs).detach()
+        self._update_discriminator()
+        self._add_discriminator_rewards()
+        with torch.no_grad():
+            last_values= self.actor_critic.evaluate(last_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
+
+    @staticmethod
+    def _adv_loss(logits, target):
+        targets = torch.full_like(logits, fill_value=float(target))
+        return F.binary_cross_entropy_with_logits(logits, targets)
+
+    @staticmethod
+    def _r1_reg(d_out, x_in):
+        batch_size = x_in.size(0)
+        grad_dout = torch.autograd.grad(
+            outputs=d_out.sum(),
+            inputs=x_in,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        return 0.5 * grad_dout.pow(2).view(batch_size, -1).sum(1).mean(0)
+
+    def _ensure_discriminator(self, discriminator_sequences):
+        if not self.use_discriminator or self.discriminator is not None or discriminator_sequences is None:
+            return
+        motion_dim = discriminator_sequences["generated_motion"].shape[-1]
+        condition = discriminator_sequences.get("style_condition", None)
+        condition_dim = 0 if condition is None else condition.shape[-1]
+        self.discriminator = MotionStyleDiscriminator(
+            motion_dim=motion_dim,
+            condition_dim=condition_dim,
+            hidden_dim=self.discriminator_hidden_dim,
+            num_heads=self.discriminator_num_heads,
+            num_layers=self.discriminator_num_layers,
+            max_sequence_length=self.discriminator_max_sequence_length,
+        ).to(self.device)
+        self.discriminator_optimizer = optim.Adam(self.discriminator.parameters(), lr=self.discriminator_learning_rate)
+        if self.multi_gpu:
+            discriminator_params = [self.discriminator.state_dict()]
+            dist.broadcast_object_list(discriminator_params, 0)
+            self.discriminator.load_state_dict(discriminator_params[0])
+
+    def load_discriminator_state_dict(self, discriminator_state_dict, discriminator_optimizer_state_dict=None):
+        motion_dim = discriminator_state_dict["motion_proj.weight"].shape[1]
+        condition_weight = discriminator_state_dict.get("condition_proj.weight", None)
+        condition_dim = 0 if condition_weight is None else condition_weight.shape[1]
+        max_sequence_length = discriminator_state_dict["pos_embedding"].shape[1] - 3
+        self.discriminator = MotionStyleDiscriminator(
+            motion_dim=motion_dim,
+            condition_dim=condition_dim,
+            hidden_dim=self.discriminator_hidden_dim,
+            num_heads=self.discriminator_num_heads,
+            num_layers=self.discriminator_num_layers,
+            max_sequence_length=max_sequence_length,
+        ).to(self.device)
+        self.discriminator.load_state_dict(discriminator_state_dict)
+        self.discriminator_optimizer = optim.Adam(self.discriminator.parameters(), lr=self.discriminator_learning_rate)
+        if discriminator_optimizer_state_dict is not None:
+            self.discriminator_optimizer.load_state_dict(discriminator_optimizer_state_dict)
+
+    def _select_valid_discriminator_sequences(self, discriminator_sequences):
+        padding_mask = discriminator_sequences.get("padding_mask", None)
+        valid = None
+        if padding_mask is not None:
+            valid = ~padding_mask.any(dim=1)
+        valid_mask = discriminator_sequences.get("valid_mask", None)
+        if valid_mask is not None:
+            sequence_valid = valid_mask.squeeze(-1).bool().all(dim=1)
+            valid = sequence_valid if valid is None else (valid & sequence_valid)
+        if valid is None:
+            return {key: value for key, value in discriminator_sequences.items() if key not in ("padding_mask", "valid_mask")}
+        if not valid.any():
+            return None
+        return {
+            key: value[valid] if isinstance(value, torch.Tensor) and value.shape[0] == valid.shape[0] else value
+            for key, value in discriminator_sequences.items()
+            if key not in ("padding_mask", "valid_mask")
+        }
+
+    def _all_reduce_module_grads(self, module):
+        if not self.multi_gpu or module is None:
+            return
+        all_grads_list = []
+        for param in module.parameters():
+            if param.grad is not None:
+                all_grads_list.append(param.grad.view(-1))
+        if len(all_grads_list) == 0:
+            return
+        all_grads = torch.cat(all_grads_list)
+        dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
+        offset = 0
+        for param in module.parameters():
+            if param.grad is not None:
+                param.grad.data.copy_(
+                    all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.multi_gpu_size
+                )
+                offset += param.numel()
+
+    def _update_discriminator(self):
+        if not self.use_discriminator or self.storage is None:
+            return
+        discriminator_sequences = self.storage.get_discriminator_sequences(self.discriminator_sequence_length)
+        if discriminator_sequences is None:
+            return
+        self._ensure_discriminator(discriminator_sequences)
+        discriminator_sequences = self._select_valid_discriminator_sequences(discriminator_sequences)
+        if self.discriminator is None or discriminator_sequences is None:
+            return
+
+        stats = {}
+        for _ in range(max(1, self.discriminator_updates_per_iter)):
+            generated_motion = discriminator_sequences["generated_motion"].detach()
+            style_motion = discriminator_sequences["style_motion"].detach().clone()
+            style_motion.requires_grad_(self.discriminator_r1_coef > 0.0)
+            content_condition = discriminator_sequences.get("content_condition", None)
+            style_condition = discriminator_sequences.get("style_condition", None)
+            if content_condition is not None:
+                content_condition = content_condition.detach()
+            if style_condition is not None:
+                style_condition = style_condition.detach()
+
+            real_logits = self.discriminator(style_motion, content_condition, style_condition)
+            fake_logits = self.discriminator(generated_motion, content_condition, style_condition)
+            loss_real = self._adv_loss(real_logits, 1)
+            loss_fake = self._adv_loss(fake_logits, 0)
+            loss_reg = self._r1_reg(real_logits, style_motion) if self.discriminator_r1_coef > 0.0 else torch.zeros_like(loss_real)
+            discriminator_loss = loss_real + loss_fake + self.discriminator_r1_coef * loss_reg
+
+            if not torch.isfinite(discriminator_loss):
+                print("[PPO] Non-finite discriminator loss detected; skipping discriminator step.")
+                continue
+
+            self.discriminator_optimizer.zero_grad()
+            discriminator_loss.backward()
+            self._all_reduce_module_grads(self.discriminator)
+            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+            self.discriminator_optimizer.step()
+
+            stats = {
+                "D_loss": discriminator_loss.item(),
+                "D_real": loss_real.item(),
+                "D_fake": loss_fake.item(),
+                "D_reg": loss_reg.item(),
+            }
+        self.last_discriminator_stats = stats
+
+    def _add_discriminator_rewards(self):
+        if not self.use_discriminator or self.storage is None:
+            return
+        if (
+            self.discriminator_reward_coef == 0.0
+            and self.discriminator_recon_coef == 0.0
+            and self.discriminator_content_coef == 0.0
+            and self.discriminator_cycle_content_coef == 0.0
+            and self.discriminator_cycle_style_coef == 0.0
+            and self.discriminator_smoothness_coef == 0.0
+            and self.discriminator_accel_coef == 0.0
+            and self.discriminator_contact_coef == 0.0
+        ):
+            return
+
+        discriminator_sequences = self.storage.get_discriminator_sequences(self.discriminator_sequence_length)
+        if discriminator_sequences is None:
+            return
+        self._ensure_discriminator(discriminator_sequences)
+        if self.discriminator is None or discriminator_sequences is None:
+            return
+
+        padding_mask = discriminator_sequences.get("padding_mask", None)
+        valid = None if padding_mask is None else (~padding_mask.any(dim=1)).float()
+        valid_mask = discriminator_sequences.get("valid_mask", None)
+        if valid_mask is not None:
+            sequence_valid = valid_mask.squeeze(-1).bool().all(dim=1).float()
+            valid = sequence_valid if valid is None else valid * sequence_valid
+        generated_motion = discriminator_sequences["generated_motion"]
+        content_motion = discriminator_sequences.get("content_motion", None)
+        style_motion = discriminator_sequences.get("style_motion", None)
+        content_condition = discriminator_sequences.get("content_condition", None)
+        style_condition = discriminator_sequences.get("style_condition", None)
+
+        sequence_rewards = torch.zeros(generated_motion.shape[0], device=self.device)
+        reward_stats = {}
+        was_training = self.discriminator.training
+        self.discriminator.eval()
+        with torch.no_grad():
+            if self.discriminator_reward_coef != 0.0:
+                fake_logits = self.discriminator(generated_motion, content_condition, style_condition, padding_mask=padding_mask)
+                adv_reward = -F.binary_cross_entropy_with_logits(
+                    fake_logits,
+                    torch.ones_like(fake_logits),
+                    reduction="none",
+                )
+                sequence_rewards += self.discriminator_reward_coef * adv_reward
+                reward_stats["G_adv_reward"] = adv_reward.mean().item()
+
+            content_preserve_coef = (
+                self.discriminator_content_coef
+                + self.discriminator_recon_coef
+                + self.discriminator_cycle_content_coef
+            )
+            if content_preserve_coef != 0.0 and content_motion is not None:
+                content_error = torch.norm(generated_motion - content_motion, dim=-1).mean(dim=1)
+                sequence_rewards -= content_preserve_coef * content_error
+                reward_stats["G_content_error"] = content_error.mean().item()
+
+            if self.discriminator_cycle_style_coef != 0.0 and style_motion is not None:
+                style_error = torch.norm(generated_motion - style_motion, dim=-1).mean(dim=1)
+                sequence_rewards -= self.discriminator_cycle_style_coef * style_error
+                reward_stats["G_style_error"] = style_error.mean().item()
+
+            if self.discriminator_smoothness_coef != 0.0 and generated_motion.shape[1] > 1:
+                velocity = generated_motion[:, 1:] - generated_motion[:, :-1]
+                smoothness_error = torch.norm(velocity, dim=-1).mean(dim=1)
+                sequence_rewards -= self.discriminator_smoothness_coef * smoothness_error
+                reward_stats["G_reg_vel"] = smoothness_error.mean().item()
+
+            if self.discriminator_accel_coef != 0.0 and generated_motion.shape[1] > 2:
+                velocity = generated_motion[:, 1:] - generated_motion[:, :-1]
+                acceleration = velocity[:, 1:] - velocity[:, :-1]
+                acceleration_error = torch.norm(acceleration, dim=-1).mean(dim=1)
+                sequence_rewards -= self.discriminator_accel_coef * acceleration_error
+                reward_stats["G_reg_acc"] = acceleration_error.mean().item()
+
+            if self.discriminator_contact_coef != 0.0 and "generated_feet_pos" in discriminator_sequences:
+                generated_feet_pos = discriminator_sequences["generated_feet_pos"]
+                contact = discriminator_sequences.get("style_contact", discriminator_sequences.get("content_contact", None))
+                if contact is not None and generated_feet_pos.shape[1] > 1:
+                    feet_velocity = torch.norm(generated_feet_pos[:, 1:] - generated_feet_pos[:, :-1], dim=-1)
+                    stance_mask = contact[:, 1:].float()
+                    if stance_mask.shape[-1] != feet_velocity.shape[-1]:
+                        stance_mask = stance_mask[..., : feet_velocity.shape[-1]]
+                    contact_error = (feet_velocity * stance_mask).sum(dim=(1, 2)) / stance_mask.sum(dim=(1, 2)).clamp_min(1.0)
+                    sequence_rewards -= self.discriminator_contact_coef * contact_error
+                    reward_stats["G_reg_contact"] = contact_error.mean().item()
+
+        if was_training:
+            self.discriminator.train()
+        if valid is not None:
+            sequence_rewards = sequence_rewards * valid
+        if len(reward_stats) > 0:
+            reward_stats["G_sequence_reward"] = sequence_rewards.mean().item()
+            self.last_discriminator_stats.update(reward_stats)
+        self.storage.add_discriminator_sequence_rewards(sequence_rewards, self.discriminator_sequence_length)
     
     def switch_to_rl(self):
         self.bc_loss_coef = 0.0
