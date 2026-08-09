@@ -420,6 +420,10 @@ class LeggedRobotViser:
         # Add clip selection dropdown
         self.clip_selection = None  # Will be set later
         self.clip_start_offset = None 
+        self.content_clip_selection = None
+        self.style_clip_selection = None
+        self.content_clip_start_offset = None
+        self.style_clip_start_offset = None
 
         @self.show_robot.on_update
         def _(_) -> None:
@@ -666,6 +670,111 @@ class LeggedRobotViser:
                 camera_pos, lookat_pos = self.get_camera_position_for_robot(env_offset, root_pos)
                 self.set_viewer_camera(position=camera_pos, lookat=lookat_pos)
                 break
+
+    def setup_style_transfer_clip_selection(self, content_clips: List[Union[str, Tuple[str, int]]],
+                                            style_clips: List[Union[str, Tuple[str, int]]]):
+        """
+        Set up paired content/style clip selectors for stage-2 style-transfer playback.
+
+        Each option may be a display string or a (display string, replay index)
+        tuple. The replay index is passed back to RobotDeepMimic unchanged.
+        """
+        def _normalize_options(options):
+            labels = []
+            index_by_label = {}
+            for fallback_idx, option in enumerate(options):
+                if isinstance(option, tuple):
+                    label, replay_idx = option
+                else:
+                    label, replay_idx = option, fallback_idx
+                labels.append(label)
+                index_by_label[label] = int(replay_idx)
+            return labels, index_by_label
+
+        content_labels, self.content_clip_index_by_label = _normalize_options(content_clips)
+        style_labels, self.style_clip_index_by_label = _normalize_options(style_clips)
+        if not content_labels or not style_labels:
+            return
+
+        if self.content_clip_selection is None:
+            with self.server.gui.add_folder("Style Transfer Clips"):
+                self.content_clip_selection = self.server.gui.add_dropdown(
+                    "Content Clip",
+                    options=content_labels,
+                    initial_value=content_labels[0],
+                    hint="Select the motion clip used for the content stream"
+                )
+                self.style_clip_selection = self.server.gui.add_dropdown(
+                    "Style Clip",
+                    options=style_labels,
+                    initial_value=style_labels[0],
+                    hint="Select the motion clip used for the style stream"
+                )
+                self.content_clip_start_offset = self.server.gui.add_slider(
+                    "Content Start Frame",
+                    min=0,
+                    max=10000,
+                    step=1,
+                    initial_value=0,
+                    hint="Select the content clip starting frame"
+                )
+                self.style_clip_start_offset = self.server.gui.add_slider(
+                    "Style Start Frame",
+                    min=0,
+                    max=10000,
+                    step=1,
+                    initial_value=0,
+                    hint="Select the style clip starting frame"
+                )
+
+            @self.content_clip_selection.on_update
+            def _(event) -> None:
+                self.select_style_transfer_pair()
+
+            @self.style_clip_selection.on_update
+            def _(event) -> None:
+                self.select_style_transfer_pair()
+
+            @self.content_clip_start_offset.on_update
+            def _(event) -> None:
+                self.select_style_transfer_pair()
+
+            @self.style_clip_start_offset.on_update
+            def _(event) -> None:
+                self.select_style_transfer_pair()
+
+            self.select_style_transfer_pair()
+        else:
+            self.content_clip_selection.options = content_labels
+            self.style_clip_selection.options = style_labels
+            if self.content_clip_selection.value not in content_labels:
+                self.content_clip_selection.value = content_labels[0]
+            if self.style_clip_selection.value not in style_labels:
+                self.style_clip_selection.value = style_labels[0]
+
+    def select_style_transfer_pair(self):
+        """Apply the selected content/style pair to the visualization environment."""
+        if self.content_clip_selection is None or self.style_clip_selection is None:
+            return
+        content_label = self.content_clip_selection.value
+        style_label = self.style_clip_selection.value
+        if content_label not in self.content_clip_index_by_label or style_label not in self.style_clip_index_by_label:
+            return
+
+        content_idx = self.content_clip_index_by_label[content_label]
+        style_idx = self.style_clip_index_by_label[style_label]
+        self.robot.set_visualization_pair(
+            content_idx,
+            style_idx,
+            self.content_clip_start_offset.value,
+            self.style_clip_start_offset.value,
+        )
+
+        current_state = self.robot.replay_data_loader.get_current_data()
+        env_offset = self.robot.env_offsets[0].cpu().numpy()
+        root_pos = current_state.root_pos[0].cpu().numpy()
+        camera_pos, lookat_pos = self.get_camera_position_for_robot(env_offset, root_pos)
+        self.set_viewer_camera(position=camera_pos, lookat=lookat_pos)
 
     def add_mesh(self, 
                  name: str,
