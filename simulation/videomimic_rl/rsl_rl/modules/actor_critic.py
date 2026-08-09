@@ -34,6 +34,7 @@ import json
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.nn.modules import rnn
 from typing import Dict, List, Optional, Tuple
@@ -213,6 +214,7 @@ class StyleTransformer(nn.Module):
         self.decoder_query = nn.Parameter(torch.randn(num_parts, part_dim))
         self.decoder = TransformerDecoder(part_dim, num_heads=num_heads, num_layers=num_dec_layers, num_parts=num_parts)
         self.content_decoder_gate = nn.Parameter(torch.tensor(-4.0))
+        self.style_decoder_gate = nn.Parameter(torch.tensor(-4.0))
 
         # learnable style tokens, one token per body part, matching class.py
         self.learnable_style_token = nn.Parameter(torch.randn(1, num_parts, part_dim))
@@ -250,7 +252,7 @@ class StyleTransformer(nn.Module):
         self._generated_feature_contrib_count = 0
         return stats
 
-    def forward(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
+    def generate_motion(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
         # cnt/sty: (B, input_dim)
         B = cnt.shape[0]
 
@@ -273,16 +275,10 @@ class StyleTransformer(nn.Module):
         cnt_of_content_motion = cnt_enc[:, style_token_count:, :]
         cnt_enc_IN = self.encoder_IN(cnt_of_content_motion)
 
-        if content_only:
+        if content_only or sty is None:
             content_style_signal = cnt_enc_IN.reshape(B, -1)
             generated_tokens = decode_tokens(cnt_enc_IN, content_style_signal)
-            generated_motion = self.motion_proj(generated_tokens.reshape(B, -1))
-            generated_feature = self.out_proj(generated_motion)
-            decoder_gate = torch.sigmoid(self.content_decoder_gate)
-            weighted_generated_feature = decoder_gate * generated_feature
-            output = cnt + weighted_generated_feature
-            self._record_generated_feature_contribution(weighted_generated_feature, output)
-            return output
+            return self.motion_proj(generated_tokens.reshape(B, -1))
 
         sty_enc_IN = encode_stream(sty, add_style_token=True)
         sty_of_sty_enc = sty_enc_IN[:, :style_token_count, :]
@@ -295,10 +291,25 @@ class StyleTransformer(nn.Module):
 
         # TransformerDecoder generates the motion tokens that will be tracked later
         generated_tokens = decode_tokens(cnt_enc_IN + modulated_tokens, modulated)
-        generated_motion = self.motion_proj(generated_tokens.reshape(B, -1))
+        return self.motion_proj(generated_tokens.reshape(B, -1))
 
-        out = self.out_proj(generated_motion)
-        return out
+    def forward(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
+        generated_motion = self.generate_motion(cnt, sty=sty, content_only=content_only)
+
+        if content_only:
+            generated_feature = self.out_proj(generated_motion)
+            decoder_gate = torch.sigmoid(self.content_decoder_gate)
+            weighted_generated_feature = decoder_gate * generated_feature
+            output = cnt + weighted_generated_feature
+            self._record_generated_feature_contribution(weighted_generated_feature, output)
+            return output
+
+        styled = self.out_proj(generated_motion)
+        gate = torch.sigmoid(self.style_decoder_gate)
+        weighted_style_delta = gate * (styled - cnt)
+        output = cnt + weighted_style_delta
+        self._record_generated_feature_contribution(weighted_style_delta, output)
+        return output
 
 
 class ForwardProcDict(nn.Module):
@@ -420,6 +431,7 @@ class ActorCritic(nn.Module):
                         stage=1,
                         freeze_style_branch=False,
                         style_lr_scale=0.1,
+                        content_lr_scale=0.2,
                         style_lr_warmup_steps=5000,
                         style_num_parts=6,
                         style_part_dim=None,
@@ -444,6 +456,7 @@ class ActorCritic(nn.Module):
         self.freeze_style_branch = bool(freeze_style_branch) or self.stage == 1
         self.use_style_stream = self.stage >= 2 and not self.freeze_style_branch
         self.style_lr_scale = float(style_lr_scale)
+        self.content_lr_scale = float(content_lr_scale)
         self.style_lr_warmup_steps = int(style_lr_warmup_steps)
 
         actor_shared_shapes, actor_shared_spec, actor_stream_shapes, actor_stream_spec = _split_obs_streams(obs_shapes, obs_proc_actor)
@@ -548,6 +561,46 @@ class ActorCritic(nn.Module):
         )
         return name.startswith(style_stream_prefixes) or any(module_name in name for module_name in generation_modules)
 
+    def _get_optimizer_group_name(self, name: str) -> str:
+        if name == "std" or name.startswith(("actor.", "critic.")):
+            return "head"
+
+        style_stream_prefixes = (
+            "actor_stream_modules.actor_style_",
+            "critic_stream_modules.critic_style_",
+        )
+        style_generation_modules = (
+            ".modulator.",
+            ".decoder.",
+            ".decoder_query",
+            ".style_decoder_gate",
+            ".motion_proj.",
+            ".out_proj.",
+            ".learnable_style_token",
+        )
+        if name.startswith(style_stream_prefixes) or any(module_name in name for module_name in style_generation_modules):
+            return "style"
+
+        content_input_prefixes = (
+            "actor_stream_modules.actor_content_input_net",
+            "critic_stream_modules.critic_content_input_net",
+        )
+        content_backbone_prefixes = (
+            "actor_stream_modules.actor_content_backbone",
+            "critic_stream_modules.critic_content_backbone",
+        )
+        content_encoder_modules = (
+            ".part_proj.",
+            ".encoder.",
+            ".encoder_IN.",
+        )
+        if name.startswith(content_input_prefixes):
+            return "content"
+        if name.startswith(content_backbone_prefixes) and any(module_name in name for module_name in content_encoder_modules):
+            return "content"
+
+        return "base"
+
     def _apply_stage_freeze(self):
         freeze_generation = self.stage == 1 or self._freeze_style_branch_override
         for name, param in self.named_parameters():
@@ -569,6 +622,15 @@ class ActorCritic(nn.Module):
             return self.style_lr_scale
         return 1.0
 
+    def get_optimizer_lr_scales(self, current_learning_iteration: int) -> Dict[str, float]:
+        content_lr_scale = self.content_lr_scale if self.stage >= 2 else 1.0
+        return {
+            "base": 1.0,
+            "content": content_lr_scale,
+            "style": self.get_style_lr_scale(current_learning_iteration),
+            "head": 1.0,
+        }
+
     def get_and_reset_generated_feature_contribution_stats(self) -> Dict[str, Dict[str, float]]:
         stats = {}
         for module_name, module in self.named_modules():
@@ -582,21 +644,23 @@ class ActorCritic(nn.Module):
         return stats
 
     def get_optimizer_param_groups(self, base_lr: float):
-        generation_params = []
-        base_params = []
+        grouped_params = {
+            "base": [],
+            "content": [],
+            "style": [],
+            "head": [],
+        }
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if self._is_generation_param_name(name):
-                generation_params.append(param)
-            else:
-                base_params.append(param)
+            grouped_params[self._get_optimizer_group_name(name)].append(param)
 
         param_groups = []
-        if len(base_params) > 0:
-            param_groups.append({"params": base_params, "lr": base_lr, "name": "base"})
-        if len(generation_params) > 0:
-            param_groups.append({"params": generation_params, "lr": base_lr * self.style_lr_scale if self.stage >= 2 else 0.0, "name": "style"})
+        lr_scales = self.get_optimizer_lr_scales(current_learning_iteration=0)
+        for group_name in ("base", "content", "style", "head"):
+            params = grouped_params[group_name]
+            if len(params) > 0:
+                param_groups.append({"params": params, "lr": base_lr * lr_scales[group_name], "name": group_name})
         return param_groups
     
     def re_init_std(self, init_noise_std=1.0):
@@ -790,6 +854,119 @@ class ActorCritic(nn.Module):
 
         return fused, extra_proj_outputs
 
+    def get_discriminator_counterfactual_observations(self, observations):
+        if not self.use_style_stream:
+            return {}
+
+        content_obs = {k: v for k, v in observations.items() if k.startswith("content_")}
+        style_obs = {k: v for k, v in observations.items() if k.startswith("style_")}
+        if len(content_obs) == 0 or len(style_obs) == 0:
+            return {}
+
+        content_feat, _ = self._encode_stream(
+            self.actor_stream_modules,
+            "actor_",
+            "content_",
+            content_obs,
+            apply_backbone=False,
+        )
+        style_feat, _ = self._encode_stream(
+            self.actor_stream_modules,
+            "actor_",
+            "style_",
+            style_obs,
+            apply_backbone=False,
+        )
+        if content_feat is None or style_feat is None:
+            return {}
+
+        backbone_key = "actor_content_backbone"
+        if backbone_key not in self.actor_stream_modules:
+            backbone_key = "actor_style_backbone"
+        if backbone_key not in self.actor_stream_modules:
+            return {}
+
+        backbone = self.actor_stream_modules[backbone_key]
+        if not isinstance(backbone, StyleTransformer):
+            return {}
+
+        generated_token_motion = backbone.generate_motion(content_feat, sty=style_feat, content_only=False)
+        reconstruction_motion = backbone.generate_motion(content_feat, sty=content_feat, content_only=False)
+        cycle_content_motion = backbone.generate_motion(generated_token_motion, sty=content_feat, content_only=False)
+        cycle_style_motion = backbone.generate_motion(style_feat, sty=generated_token_motion, content_only=False)
+
+        return {
+            "content_token_motion": content_feat.detach(),
+            "style_token_motion": style_feat.detach(),
+            "generated_token_motion": generated_token_motion.detach(),
+            "reconstruction_motion": reconstruction_motion.detach(),
+            "cycle_content_motion": cycle_content_motion.detach(),
+            "cycle_style_motion": cycle_style_motion.detach(),
+        }
+
+    def compute_style_auxiliary_losses(self, observations):
+        if not self.use_style_stream:
+            return {}
+
+        content_obs = {k: v for k, v in observations.items() if k.startswith("content_")}
+        style_obs = {k: v for k, v in observations.items() if k.startswith("style_")}
+        if len(content_obs) == 0 or len(style_obs) == 0:
+            return {}
+
+        content_feat, _ = self._encode_stream(
+            self.actor_stream_modules,
+            "actor_",
+            "content_",
+            content_obs,
+            apply_backbone=False,
+        )
+        style_feat, _ = self._encode_stream(
+            self.actor_stream_modules,
+            "actor_",
+            "style_",
+            style_obs,
+            apply_backbone=False,
+        )
+        if content_feat is None or style_feat is None:
+            return {}
+
+        backbone_key = "actor_content_backbone"
+        if backbone_key not in self.actor_stream_modules:
+            backbone_key = "actor_style_backbone"
+        if backbone_key not in self.actor_stream_modules:
+            return {}
+
+        backbone = self.actor_stream_modules[backbone_key]
+        if not isinstance(backbone, StyleTransformer):
+            return {}
+
+        content_target = content_feat.detach()
+        style_target = style_feat.detach()
+
+        generated_feature = backbone(content_target, sty=style_target, content_only=False)
+        reconstruction_feature = backbone(content_target, sty=content_target, content_only=False)
+        cycle_content_feature = backbone(generated_feature, sty=content_target, content_only=False)
+        cycle_style_feature = backbone(style_target, sty=generated_feature, content_only=False)
+
+        if generated_feature.shape[-1] % backbone.num_parts == 0:
+            generated_style = generated_feature.view(generated_feature.shape[0], backbone.num_parts, -1)
+            style_feature = style_target.view(style_target.shape[0], backbone.num_parts, -1)
+        else:
+            generated_style = generated_feature.unsqueeze(1)
+            style_feature = style_target.unsqueeze(1)
+
+        generated_style_mean = generated_style.mean(dim=-1)
+        style_mean = style_feature.mean(dim=-1)
+        generated_style_std = generated_style.std(dim=-1, unbiased=False)
+        style_std = style_feature.std(dim=-1, unbiased=False)
+        style_stat_loss = F.mse_loss(generated_style_mean, style_mean) + F.mse_loss(generated_style_std, style_std)
+
+        return {
+            "recon": F.mse_loss(reconstruction_feature, content_target),
+            "cycle_content": F.mse_loss(cycle_content_feature, content_target),
+            "cycle_style": F.mse_loss(cycle_style_feature, style_target) + style_stat_loss,
+        }
+
     def _make_zero_stream_feature(self, reference_tensor: torch.Tensor, feature_dim: int, fallback_parameter: Optional[torch.Tensor] = None):
         if fallback_parameter is None:
             return reference_tensor.new_zeros(reference_tensor.shape[0], feature_dim)
@@ -813,6 +990,9 @@ class ActorCritic(nn.Module):
             dual_feat, dual_extra = self._encode_dual_stream(self.actor_stream_modules, "actor_", content_obs, style_obs)
             if dual_feat is not None:
                 features.append(dual_feat)
+                style_dim = self.actor_stream_dims.get("style_")
+                if style_dim is not None:
+                    features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.actor_stream_fallback))
             if dual_extra is not None:
                 extra_proj_outputs.extend(dual_extra)
         else:
@@ -856,6 +1036,9 @@ class ActorCritic(nn.Module):
             dual_feat, dual_extra = self._encode_dual_stream(self.critic_stream_modules, "critic_", content_obs, style_obs)
             if dual_feat is not None:
                 features.append(dual_feat)
+                style_dim = self.critic_stream_dims.get("style_")
+                if style_dim is not None:
+                    features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.critic_stream_fallback))
             if dual_extra is not None:
                 extra_proj_outputs.extend(dual_extra)
         else:

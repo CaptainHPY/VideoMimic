@@ -49,6 +49,7 @@ class RolloutStorage:
             self.teacher_actions = None
             self.teacher_values = None
             self.discriminator_observations = None
+            self.auxiliary_observations = None
 
         def clear(self):
             self.__init__()
@@ -95,6 +96,7 @@ class RolloutStorage:
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
         self.discriminator_observations = None
+        self.auxiliary_observations = None
 
         self.step = 0
 
@@ -108,6 +110,18 @@ class RolloutStorage:
                 dtype=value.dtype,
             )
             for key, value in discriminator_observations.items()
+        }
+
+    def _init_auxiliary_storage(self, auxiliary_observations):
+        self.auxiliary_observations = {
+            key: torch.zeros(
+                self.num_transitions_per_env,
+                self.num_envs,
+                *value.shape[1:],
+                device=self.device,
+                dtype=value.dtype,
+            )
+            for key, value in auxiliary_observations.items()
         }
 
     def add_transitions(self, transition: Transition):
@@ -133,6 +147,11 @@ class RolloutStorage:
                 self._init_discriminator_storage(transition.discriminator_observations)
             for key, value in transition.discriminator_observations.items():
                 self.discriminator_observations[key][self.step].copy_(value)
+        if transition.auxiliary_observations is not None:
+            if self.auxiliary_observations is None:
+                self._init_auxiliary_storage(transition.auxiliary_observations)
+            for key, value in transition.auxiliary_observations.items():
+                self.auxiliary_observations[key][self.step].copy_(value)
         
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
@@ -229,6 +248,9 @@ class RolloutStorage:
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
         observations = {k: v.flatten(0, 1) for k, v in self.observations.items()}
+        auxiliary_observations = None
+        if self.auxiliary_observations is not None:
+            auxiliary_observations = {k: v.flatten(0, 1) for k, v in self.auxiliary_observations.items()}
         # observations = self.observations.flatten(0, 1)
         # if self.privileged_observations is not None:
         #     critic_observations = self.privileged_observations.flatten(0, 1)
@@ -255,6 +277,9 @@ class RolloutStorage:
 
                 # obs_batch = observations[batch_idx]
                 obs_batch = {k: v[batch_idx] for k, v in observations.items()}
+                auxiliary_obs_batch = None if auxiliary_observations is None else {
+                    k: v[batch_idx] for k, v in auxiliary_observations.items()
+                }
                 # critic_observations_batch = critic_observations[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
@@ -270,12 +295,12 @@ class RolloutStorage:
                     yield obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, teacher_actions_batch, teacher_values_batch, (
                         None,
                         None,
-                    ), None
+                    ), None, auxiliary_obs_batch
                 else:
-                    yield obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                    yield obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, None, None, (
                         None,
                         None,
-                    ), None
+                    ), None, auxiliary_obs_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -289,6 +314,11 @@ class RolloutStorage:
         padded_obs_trajectories = {}
         for k, v in self.observations.items():
             padded_obs_trajectories[k], trajectory_masks = split_and_pad_trajectories(v, self.dones)
+        padded_auxiliary_trajectories = None
+        if self.auxiliary_observations is not None:
+            padded_auxiliary_trajectories = {}
+            for k, v in self.auxiliary_observations.items():
+                padded_auxiliary_trajectories[k], _ = split_and_pad_trajectories(v, self.dones)
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -306,6 +336,11 @@ class RolloutStorage:
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = {k:v[:, first_traj:last_traj] for k, v in padded_obs_trajectories.items()}
+                auxiliary_obs_batch = None
+                if padded_auxiliary_trajectories is not None:
+                    auxiliary_obs_batch = {
+                        k: v[:, first_traj:last_traj] for k, v in padded_auxiliary_trajectories.items()
+                    }
                 # critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
 
                 actions_batch = self.actions[:, start:stop]
@@ -344,12 +379,12 @@ class RolloutStorage:
                     yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, teacher_actions_batch, teacher_values_batch, (
                         hid_a_batch,
                         hid_c_batch,
-                    ), masks_batch
+                    ), masks_batch, auxiliary_obs_batch
                 else:
                     # yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
-                    yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                    yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, None, None, (
                         hid_a_batch,
                         hid_c_batch,
-                    ), masks_batch
+                    ), masks_batch, auxiliary_obs_batch
 
                 first_traj = last_traj

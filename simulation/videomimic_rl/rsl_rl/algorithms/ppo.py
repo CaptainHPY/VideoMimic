@@ -34,6 +34,7 @@ import torch.optim as optim
 import torch.distributed as dist
 import os
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from rsl_rl.modules import ActorCritic, MotionStyleDiscriminator
 from rsl_rl.storage import RolloutStorage
@@ -80,13 +81,12 @@ class PPO:
         discriminator_r1_coef=10.0,
         discriminator_reward_coef=0.0,
         discriminator_recon_coef=0.0,
-        discriminator_content_coef=0.0,
         discriminator_cycle_content_coef=0.0,
         discriminator_cycle_style_coef=0.0,
-        discriminator_smoothness_coef=0.0,
-        discriminator_accel_coef=0.0,
-        discriminator_contact_coef=0.0,
         discriminator_max_sequence_length=64,
+        auxiliary_recon_loss_coef=0.0,
+        auxiliary_cycle_content_loss_coef=0.0,
+        auxiliary_cycle_style_loss_coef=0.0,
     ):
 
         self.device = device
@@ -144,16 +144,17 @@ class PPO:
         self.discriminator_r1_coef = float(discriminator_r1_coef)
         self.discriminator_reward_coef = float(discriminator_reward_coef)
         self.discriminator_recon_coef = float(discriminator_recon_coef)
-        self.discriminator_content_coef = float(discriminator_content_coef)
         self.discriminator_cycle_content_coef = float(discriminator_cycle_content_coef)
         self.discriminator_cycle_style_coef = float(discriminator_cycle_style_coef)
-        self.discriminator_smoothness_coef = float(discriminator_smoothness_coef)
-        self.discriminator_accel_coef = float(discriminator_accel_coef)
-        self.discriminator_contact_coef = float(discriminator_contact_coef)
         self.discriminator_max_sequence_length = int(discriminator_max_sequence_length)
         self.discriminator = None
         self.discriminator_optimizer = None
         self.last_discriminator_stats = {}
+        self._warned_missing_discriminator_reward_fields = set()
+        self.auxiliary_recon_loss_coef = float(auxiliary_recon_loss_coef)
+        self.auxiliary_cycle_content_loss_coef = float(auxiliary_cycle_content_loss_coef)
+        self.auxiliary_cycle_style_loss_coef = float(auxiliary_cycle_style_loss_coef)
+        self.last_auxiliary_loss_stats = {}
 
         if self.bc_loss_coef > 0.0 or self.switch_to_rl_after > 0 and self.policy_to_clone is not None:
             if self.use_multi_teacher:
@@ -165,16 +166,15 @@ class PPO:
             raise ValueError('policy_to_clone must be provided if bc_loss_coef > 0.0')
 
     def _sync_optimizer_learning_rates(self, current_learning_iteration):
-        style_lr_scale = 1.0
-        if hasattr(self.actor_critic, "get_style_lr_scale"):
-            style_lr_scale = self.actor_critic.get_style_lr_scale(current_learning_iteration)
+        lr_scales = {}
+        if hasattr(self.actor_critic, "get_optimizer_lr_scales"):
+            lr_scales = self.actor_critic.get_optimizer_lr_scales(current_learning_iteration)
+        elif hasattr(self.actor_critic, "get_style_lr_scale"):
+            lr_scales["style"] = self.actor_critic.get_style_lr_scale(current_learning_iteration)
 
         for param_group in self.optimizer.param_groups:
-            group_name = param_group.get("name", "")
-            if group_name == "style":
-                param_group["lr"] = self.learning_rate * style_lr_scale
-            else:
-                param_group["lr"] = self.learning_rate
+            group_name = param_group.get("name", "base")
+            param_group["lr"] = self.learning_rate * lr_scales.get(group_name, 1.0)
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_shapes, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, obs_shapes, action_shape, has_teacher_actions=self.has_teacher_actions, device=self.device)
@@ -221,8 +221,19 @@ class PPO:
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
         if 'discriminator' in infos:
-            self.transition.discriminator_observations = {
+            discriminator_observations = {
                 key: value.to(self.device) for key, value in infos['discriminator'].items()
+            }
+            if hasattr(self.actor_critic, "get_discriminator_counterfactual_observations"):
+                counterfactual_observations = self.actor_critic.get_discriminator_counterfactual_observations(
+                    self.transition.observations
+                )
+                for key, value in counterfactual_observations.items():
+                    discriminator_observations[key] = value.to(self.device)
+            self.transition.discriminator_observations = discriminator_observations
+        if 'auxiliary' in infos:
+            self.transition.auxiliary_observations = {
+                key: value.to(self.device) for key, value in infos['auxiliary'].items()
             }
 
         # Record the transition
@@ -256,6 +267,56 @@ class PPO:
             only_inputs=True,
         )[0]
         return 0.5 * grad_dout.pow(2).view(batch_size, -1).sum(1).mean(0)
+
+    def _discriminator_attention_context(self):
+        if self.discriminator_r1_coef <= 0.0 or not torch.cuda.is_available():
+            return nullcontext()
+
+        cuda_backends = getattr(torch.backends, "cuda", None)
+        sdp_kernel = getattr(cuda_backends, "sdp_kernel", None) if cuda_backends is not None else None
+        if sdp_kernel is None:
+            return nullcontext()
+
+        return sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)
+
+    def _warn_missing_discriminator_reward_field(self, field_group, field_names):
+        if field_group in self._warned_missing_discriminator_reward_fields:
+            return
+        self._warned_missing_discriminator_reward_fields.add(field_group)
+        print(
+            f"[PPO] Skipping discriminator {field_group} reward because none of these "
+            f"rollout fields are available: {list(field_names)}"
+        )
+
+    @staticmethod
+    def _get_first_available(discriminator_sequences, field_names):
+        for field_name in field_names:
+            if field_name in discriminator_sequences:
+                return discriminator_sequences[field_name]
+        return None
+
+    @staticmethod
+    def _masked_sequence_l2_error(prediction, target, padding_mask=None, valid_mask=None):
+        difference = prediction - target
+        if difference.dim() < 3:
+            raise ValueError(
+                f"Expected sequence tensors with shape (B, T, ...), got {tuple(difference.shape)}"
+            )
+
+        reduce_dims = tuple(range(2, difference.dim()))
+        token_error = torch.linalg.vector_norm(difference, dim=reduce_dims)
+        token_mask = torch.ones_like(token_error)
+
+        if padding_mask is not None:
+            token_mask = token_mask * (~padding_mask.bool()).float()
+
+        if valid_mask is not None:
+            valid = valid_mask
+            if valid.dim() > 2:
+                valid = valid.bool().flatten(start_dim=2).all(dim=-1)
+            token_mask = token_mask * valid.float()
+
+        return (token_error * token_mask).sum(dim=1) / token_mask.sum(dim=1).clamp_min(1.0)
 
     def _ensure_discriminator(self, discriminator_sequences):
         if not self.use_discriminator or self.discriminator is not None or discriminator_sequences is None:
@@ -356,12 +417,13 @@ class PPO:
             if style_condition is not None:
                 style_condition = style_condition.detach()
 
-            real_logits = self.discriminator(style_motion, content_condition, style_condition)
-            fake_logits = self.discriminator(generated_motion, content_condition, style_condition)
-            loss_real = self._adv_loss(real_logits, 1)
-            loss_fake = self._adv_loss(fake_logits, 0)
-            loss_reg = self._r1_reg(real_logits, style_motion) if self.discriminator_r1_coef > 0.0 else torch.zeros_like(loss_real)
-            discriminator_loss = loss_real + loss_fake + self.discriminator_r1_coef * loss_reg
+            with self._discriminator_attention_context():
+                real_logits = self.discriminator(style_motion, content_condition, style_condition)
+                fake_logits = self.discriminator(generated_motion, content_condition, style_condition)
+                loss_real = self._adv_loss(real_logits, 1)
+                loss_fake = self._adv_loss(fake_logits, 0)
+                loss_reg = self._r1_reg(real_logits, style_motion) if self.discriminator_r1_coef > 0.0 else torch.zeros_like(loss_real)
+                discriminator_loss = loss_real + loss_fake + self.discriminator_r1_coef * loss_reg
 
             if not torch.isfinite(discriminator_loss):
                 print("[PPO] Non-finite discriminator loss detected; skipping discriminator step.")
@@ -387,12 +449,8 @@ class PPO:
         if (
             self.discriminator_reward_coef == 0.0
             and self.discriminator_recon_coef == 0.0
-            and self.discriminator_content_coef == 0.0
             and self.discriminator_cycle_content_coef == 0.0
             and self.discriminator_cycle_style_coef == 0.0
-            and self.discriminator_smoothness_coef == 0.0
-            and self.discriminator_accel_coef == 0.0
-            and self.discriminator_contact_coef == 0.0
         ):
             return
 
@@ -412,6 +470,8 @@ class PPO:
         generated_motion = discriminator_sequences["generated_motion"]
         content_motion = discriminator_sequences.get("content_motion", None)
         style_motion = discriminator_sequences.get("style_motion", None)
+        content_token_motion = discriminator_sequences.get("content_token_motion", None)
+        style_token_motion = discriminator_sequences.get("style_token_motion", None)
         content_condition = discriminator_sequences.get("content_condition", None)
         style_condition = discriminator_sequences.get("style_condition", None)
 
@@ -430,45 +490,63 @@ class PPO:
                 sequence_rewards += self.discriminator_reward_coef * adv_reward
                 reward_stats["G_adv_reward"] = adv_reward.mean().item()
 
-            content_preserve_coef = (
-                self.discriminator_content_coef
-                + self.discriminator_recon_coef
-                + self.discriminator_cycle_content_coef
-            )
-            if content_preserve_coef != 0.0 and content_motion is not None:
-                content_error = torch.norm(generated_motion - content_motion, dim=-1).mean(dim=1)
-                sequence_rewards -= content_preserve_coef * content_error
-                reward_stats["G_content_error"] = content_error.mean().item()
+            if self.discriminator_recon_coef != 0.0:
+                recon_field_names = (
+                    "reconstruction_motion",
+                    "generated_reconstruction_motion",
+                    "gen_recon_motion",
+                )
+                reconstruction_motion = self._get_first_available(discriminator_sequences, recon_field_names)
+                if reconstruction_motion is None:
+                    self._warn_missing_discriminator_reward_field("reconstruction", recon_field_names)
+                elif content_token_motion is None or content_token_motion.shape != reconstruction_motion.shape:
+                    self._warn_missing_discriminator_reward_field("reconstruction_target", ("content_token_motion",))
+                else:
+                    recon_error = self._masked_sequence_l2_error(
+                        reconstruction_motion,
+                        content_token_motion,
+                        padding_mask=padding_mask,
+                        valid_mask=valid_mask,
+                    )
+                    sequence_rewards -= self.discriminator_recon_coef * recon_error
+                    reward_stats["G_recon"] = recon_error.mean().item()
 
-            if self.discriminator_cycle_style_coef != 0.0 and style_motion is not None:
-                style_error = torch.norm(generated_motion - style_motion, dim=-1).mean(dim=1)
-                sequence_rewards -= self.discriminator_cycle_style_coef * style_error
-                reward_stats["G_style_error"] = style_error.mean().item()
+            if self.discriminator_cycle_content_coef != 0.0:
+                cycle_content_field_names = (
+                    "cycle_content_motion",
+                    "generated_cycle_content_motion",
+                    "gen_cycle_content_motion",
+                )
+                cycle_content_motion = self._get_first_available(discriminator_sequences, cycle_content_field_names)
+                if cycle_content_motion is None:
+                    self._warn_missing_discriminator_reward_field("cycle_content", cycle_content_field_names)
+                elif content_token_motion is None or content_token_motion.shape != cycle_content_motion.shape:
+                    self._warn_missing_discriminator_reward_field("cycle_content_target", ("content_token_motion",))
+                else:
+                    cycle_content_error = self._masked_sequence_l2_error(
+                        cycle_content_motion,
+                        content_token_motion,
+                        padding_mask=padding_mask,
+                        valid_mask=valid_mask,
+                    )
+                    sequence_rewards -= self.discriminator_cycle_content_coef * cycle_content_error
+                    reward_stats["G_cyc-c"] = cycle_content_error.mean().item()
 
-            if self.discriminator_smoothness_coef != 0.0 and generated_motion.shape[1] > 1:
-                velocity = generated_motion[:, 1:] - generated_motion[:, :-1]
-                smoothness_error = torch.norm(velocity, dim=-1).mean(dim=1)
-                sequence_rewards -= self.discriminator_smoothness_coef * smoothness_error
-                reward_stats["G_reg_vel"] = smoothness_error.mean().item()
-
-            if self.discriminator_accel_coef != 0.0 and generated_motion.shape[1] > 2:
-                velocity = generated_motion[:, 1:] - generated_motion[:, :-1]
-                acceleration = velocity[:, 1:] - velocity[:, :-1]
-                acceleration_error = torch.norm(acceleration, dim=-1).mean(dim=1)
-                sequence_rewards -= self.discriminator_accel_coef * acceleration_error
-                reward_stats["G_reg_acc"] = acceleration_error.mean().item()
-
-            if self.discriminator_contact_coef != 0.0 and "generated_feet_pos" in discriminator_sequences:
-                generated_feet_pos = discriminator_sequences["generated_feet_pos"]
-                contact = discriminator_sequences.get("style_contact", discriminator_sequences.get("content_contact", None))
-                if contact is not None and generated_feet_pos.shape[1] > 1:
-                    feet_velocity = torch.norm(generated_feet_pos[:, 1:] - generated_feet_pos[:, :-1], dim=-1)
-                    stance_mask = contact[:, 1:].float()
-                    if stance_mask.shape[-1] != feet_velocity.shape[-1]:
-                        stance_mask = stance_mask[..., : feet_velocity.shape[-1]]
-                    contact_error = (feet_velocity * stance_mask).sum(dim=(1, 2)) / stance_mask.sum(dim=(1, 2)).clamp_min(1.0)
-                    sequence_rewards -= self.discriminator_contact_coef * contact_error
-                    reward_stats["G_reg_contact"] = contact_error.mean().item()
+            if self.discriminator_cycle_style_coef != 0.0:
+                cycle_style_motion = discriminator_sequences.get("cycle_style_motion", None)
+                if cycle_style_motion is None:
+                    self._warn_missing_discriminator_reward_field("cycle_style", ("cycle_style_motion",))
+                elif style_token_motion is None or style_token_motion.shape != cycle_style_motion.shape:
+                    self._warn_missing_discriminator_reward_field("cycle_style_target", ("style_token_motion",))
+                else:
+                    style_error = self._masked_sequence_l2_error(
+                        cycle_style_motion,
+                        style_token_motion,
+                        padding_mask=padding_mask,
+                        valid_mask=valid_mask,
+                    )
+                    sequence_rewards -= self.discriminator_cycle_style_coef * style_error
+                    reward_stats["G_cyc-s"] = style_error.mean().item()
 
         if was_training:
             self.discriminator.train()
@@ -488,6 +566,16 @@ class PPO:
         mean_surrogate_loss = 0
         mean_bc_loss = 0
         mean_bounds_loss = 0
+        mean_auxiliary_recon_loss = 0
+        mean_auxiliary_cycle_content_loss = 0
+        mean_auxiliary_cycle_style_loss = 0
+        mean_auxiliary_total_loss = 0
+        use_style_auxiliary_losses = (
+            self.auxiliary_recon_loss_coef != 0.0
+            or self.auxiliary_cycle_content_loss_coef != 0.0
+            or self.auxiliary_cycle_style_loss_coef != 0.0
+        ) and hasattr(self.actor_critic, "compute_style_auxiliary_losses")
+        self.last_auxiliary_loss_stats = {}
         self._sync_optimizer_learning_rates(current_learning_iteration)
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -501,7 +589,7 @@ class PPO:
         #     old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
         for obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, teacher_actions_batch, teacher_values_batch, \
-            hid_states_batch, masks_batch in generator:
+            hid_states_batch, masks_batch, auxiliary_obs_batch in generator:
 
 
                 self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -589,11 +677,27 @@ class PPO:
                 else:
                     bounds_loss = torch.zeros_like(surrogate_loss)
 
+                auxiliary_recon_loss = torch.zeros_like(surrogate_loss)
+                auxiliary_cycle_content_loss = torch.zeros_like(surrogate_loss)
+                auxiliary_cycle_style_loss = torch.zeros_like(surrogate_loss)
+                if use_style_auxiliary_losses:
+                    style_auxiliary_obs = auxiliary_obs_batch if auxiliary_obs_batch is not None else obs_batch
+                    auxiliary_losses = self.actor_critic.compute_style_auxiliary_losses(style_auxiliary_obs)
+                    auxiliary_recon_loss = auxiliary_losses.get("recon", auxiliary_recon_loss)
+                    auxiliary_cycle_content_loss = auxiliary_losses.get("cycle_content", auxiliary_cycle_content_loss)
+                    auxiliary_cycle_style_loss = auxiliary_losses.get("cycle_style", auxiliary_cycle_style_loss)
+                auxiliary_total_loss = (
+                    self.auxiliary_recon_loss_coef * auxiliary_recon_loss
+                    + self.auxiliary_cycle_content_loss_coef * auxiliary_cycle_content_loss
+                    + self.auxiliary_cycle_style_loss_coef * auxiliary_cycle_style_loss
+                )
+
                 loss = self.actor_loss_mul * (surrogate_loss
                     - self.entropy_coef * entropy_batch.mean()) \
                     + self.value_loss_coef * value_loss \
                     + self.bc_loss_coef * bc_loss \
-                    + self.bounds_loss_coef * bounds_loss
+                    + self.bounds_loss_coef * bounds_loss \
+                    + auxiliary_total_loss
 
                 if not torch.isfinite(loss):
                     print("[PPO] Non-finite loss detected; skipping optimizer step for this mini-batch.")
@@ -649,11 +753,26 @@ class PPO:
                 mean_surrogate_loss += surrogate_loss.item()
                 mean_bc_loss += bc_loss.item()
                 mean_bounds_loss += bounds_loss.item()
+                mean_auxiliary_recon_loss += auxiliary_recon_loss.item()
+                mean_auxiliary_cycle_content_loss += auxiliary_cycle_content_loss.item()
+                mean_auxiliary_cycle_style_loss += auxiliary_cycle_style_loss.item()
+                mean_auxiliary_total_loss += auxiliary_total_loss.item()
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_bc_loss /= num_updates
         mean_bounds_loss /= num_updates
+        mean_auxiliary_recon_loss /= num_updates
+        mean_auxiliary_cycle_content_loss /= num_updates
+        mean_auxiliary_cycle_style_loss /= num_updates
+        mean_auxiliary_total_loss /= num_updates
+        if use_style_auxiliary_losses:
+            self.last_auxiliary_loss_stats = {
+                "recon": mean_auxiliary_recon_loss,
+                "cycle_content": mean_auxiliary_cycle_content_loss,
+                "cycle_style": mean_auxiliary_cycle_style_loss,
+                "total": mean_auxiliary_total_loss,
+            }
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_bc_loss, mean_bounds_loss

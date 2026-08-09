@@ -290,6 +290,9 @@ class OnPolicyRunner:
         discriminator_stats = getattr(self.alg, "last_discriminator_stats", {})
         for key, value in discriminator_stats.items():
             add_scalar(f'Discriminator/{key}', value, locs['it'])
+        auxiliary_loss_stats = getattr(self.alg, "last_auxiliary_loss_stats", {})
+        for key, value in auxiliary_loss_stats.items():
+            add_scalar(f'Auxiliary/{key}', value, locs['it'])
         add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
         add_scalar('Perf/total_fps', fps, locs['it'])
         add_scalar('Perf/collection time', locs['collection_time'], locs['it'])

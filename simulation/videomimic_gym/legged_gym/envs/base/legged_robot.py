@@ -173,6 +173,17 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
+        bad_root_vel_mask = ~torch.isfinite(self.root_states[:, 7:13]).all(dim=1)
+        if torch.any(bad_root_vel_mask):
+            bad_env_ids = torch.where(bad_root_vel_mask)[0]
+            print(f"[LeggedRobot] Non-finite root velocities for envs: {bad_env_ids.tolist()}, zeroing root velocities")
+            self.root_states[bad_env_ids, 7:13] = 0.0
+            bad_env_ids_int32 = bad_env_ids.to(dtype=torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                         gymtorch.unwrap_tensor(self.root_states),
+                                                         gymtorch.unwrap_tensor(bad_env_ids_int32), len(bad_env_ids_int32))
+        self.nonfinite_root_vel_buf = bad_root_vel_mask
+
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
@@ -195,6 +206,7 @@ class LeggedRobot(BaseTask):
 
         # compute observations, rewards, resets, ...
         self.check_termination()
+        self.reset_buf |= self.nonfinite_root_vel_buf
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)

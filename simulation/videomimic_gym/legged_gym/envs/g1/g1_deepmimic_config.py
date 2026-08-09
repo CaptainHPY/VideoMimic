@@ -727,6 +727,7 @@ class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
     stage = 1
     freeze_style_branch = False
     style_lr_scale = 0.1
+    content_lr_scale = 0.2
     style_lr_warmup_steps = 5000
 
     @configclass
@@ -1278,13 +1279,12 @@ class G1DeepMimicAlgorithmCfg(LeggedRobotAlgorithmCfg):
     discriminator_r1_coef: float = 10.0
     discriminator_reward_coef: float = 0.0
     discriminator_recon_coef: float = 0.0
-    discriminator_content_coef: float = 0.0
     discriminator_cycle_content_coef: float = 0.0
     discriminator_cycle_style_coef: float = 0.0
-    discriminator_smoothness_coef: float = 0.0
-    discriminator_accel_coef: float = 0.0
-    discriminator_contact_coef: float = 0.0
     discriminator_max_sequence_length: int = 64
+    auxiliary_recon_loss_coef: float = 0.0
+    auxiliary_cycle_content_loss_coef: float = 0.0
+    auxiliary_cycle_style_loss_coef: float = 0.0
 
 @configclass
 class G1DeepMimicCfgPPO(LeggedRobotCfgPPO):

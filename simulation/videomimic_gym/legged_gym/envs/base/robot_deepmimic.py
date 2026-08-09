@@ -7,6 +7,7 @@ from isaacgym import gymapi, gymtorch, gymutil
 from legged_gym.tensor_utils.torch_jit_utils import  *
 import torch
 import glob
+import os
 
 # import to make an abstract class
 from abc import ABC, abstractmethod
@@ -125,6 +126,9 @@ class RobotDeepMimic(LeggedRobot):
         if self.use_viser_viz:
             available_episodes = self.get_available_episodes()
             self.viser_viz.setup_clip_selection(available_episodes)
+            if self.style_replay_data_loader is not None and hasattr(self.viser_viz, "setup_style_transfer_clip_selection"):
+                content_clips, style_clips = self.get_style_transfer_clip_options()
+                self.viser_viz.setup_style_transfer_clip_selection(content_clips, style_clips)
     
     def _init_buffers(self):
         super()._init_buffers()
@@ -151,18 +155,28 @@ class RobotDeepMimic(LeggedRobot):
     def _validate_obs_tensor(self, obs, name):
         if not torch.isfinite(obs).all():
             bad_mask = ~torch.isfinite(obs)
-            bad_envs = torch.where(torch.any(bad_mask, dim=1))[0]
+            if bad_mask.ndim == 1:
+                bad_envs = torch.where(bad_mask)[0]
+            else:
+                bad_envs = torch.where(torch.any(bad_mask.view(bad_mask.shape[0], -1), dim=1))[0]
+
             if len(bad_envs) > 0:
                 print(f"[DeepMimic] Non-finite values detected in {name} for envs: {bad_envs.tolist()}")
+
             obs = self._finite_tensor(obs)
         return obs
 
     def _build_discriminator_motion_state(self, root_pos, root_quat, motor_pos, motor_vel, name):
+        safe_root_quat = self._safe_quat(root_quat)
+        projected_gravity = quat_rotate_inverse(safe_root_quat, self.gravity_vec)
+        joint_pos = (motor_pos - self.default_dof_pos) * self.obs_scales.dof_pos
+        joint_vel = motor_vel * self.obs_scales.dof_vel
+
         motion_state = torch.cat((
-            root_pos,
-            self._safe_quat(root_quat),
-            motor_pos,
-            motor_vel,
+            root_pos[..., 2:3],
+            projected_gravity,
+            joint_pos,
+            joint_vel,
         ), dim=-1)
         return self._validate_obs_tensor(motion_state, name)
 
@@ -221,9 +235,108 @@ class RobotDeepMimic(LeggedRobot):
 
         return discriminator_obs
 
+    def _build_auxiliary_reference_obs_from_fields(
+        self,
+        target_root_pos,
+        target_root_quat,
+        target_motors,
+        target_link_pos,
+        target_link_vel,
+        target_contacts,
+        name,
+    ):
+        K = self.cfg.deepmimic.num_next_obs
+        num_tracked_links = self.cfg.deepmimic.num_tracked_links
+
+        safe_root_quat = self._safe_quat(target_root_quat)
+        root_heading = calc_heading_quat_inv(safe_root_quat[:, 0])
+
+        obs_root_pos = target_root_pos - target_root_pos[:, :1]
+        heading_expand = root_heading.unsqueeze(1).repeat(1, K, 1).view(self.num_envs * K, 4)
+        obs_root_pos = quat_rotate(heading_expand, obs_root_pos.view(self.num_envs * K, 3)).view(self.num_envs, K, 3)
+
+        obs_root_quat = quat_mul(safe_root_quat, quat_conjugate(safe_root_quat[:, :1]))
+        obs_joints = target_motors - self.default_dof_pos.unsqueeze(1)
+
+        obs_link_pos = target_link_pos - target_root_pos.unsqueeze(2)
+        heading_expand_links = root_heading.unsqueeze(1).repeat(1, K * num_tracked_links, 1).view(self.num_envs * K * num_tracked_links, 4)
+        obs_link_pos = quat_rotate(heading_expand_links, obs_link_pos.view(self.num_envs * K * num_tracked_links, 3)).view(self.num_envs, K, num_tracked_links, 3)
+
+        if target_link_vel is None:
+            obs_link_vel = torch.zeros(self.num_envs, num_tracked_links, 3, device=self.device)
+        else:
+            link_vel = target_link_vel[:, 0] if target_link_vel.dim() == 4 else target_link_vel
+            heading_expand_vels = root_heading.unsqueeze(1).repeat(1, num_tracked_links, 1).view(self.num_envs * num_tracked_links, 4)
+            obs_link_vel = quat_rotate(heading_expand_vels, link_vel.view(self.num_envs * num_tracked_links, 3)).view(self.num_envs, num_tracked_links, 3)
+
+        obs_tracked_link_heights = target_link_pos[:, 0, :, 2]
+
+        obs = torch.cat((
+            obs_tracked_link_heights.view(self.num_envs, -1),
+            obs_root_quat.view(self.num_envs, -1),
+            obs_root_pos.view(self.num_envs, -1),
+            obs_joints.view(self.num_envs, -1),
+            obs_link_pos.view(self.num_envs, -1),
+            obs_link_vel.view(self.num_envs, -1),
+        ), dim=-1)
+
+        if self.cfg.deepmimic.contact_names is not None:
+            if target_contacts is None:
+                num_contacts = len(self.cfg.deepmimic.contact_names)
+                contact_sequence = torch.zeros(self.num_envs, K, num_contacts, device=self.device)
+                contact_now = contact_sequence[:, 0]
+            else:
+                contact_sequence = target_contacts.float()
+                contact_now = contact_sequence[:, 0] if contact_sequence.dim() == 3 else contact_sequence
+
+            obs = torch.cat((
+                obs,
+                contact_now.view(self.num_envs, -1),
+                contact_sequence.view(self.num_envs, -1),
+                contact_now.view(self.num_envs, -1),
+                torch.zeros_like(contact_now).view(self.num_envs, -1),
+            ), dim=-1)
+
+        return self._validate_obs_tensor(obs, name)
+
+    def _build_auxiliary_observations(self):
+        if self.style_replay_data_loader is None:
+            return None
+
+        K = self.cfg.deepmimic.num_next_obs
+        content_state = self.replay_data_loader.get_next_data(K=K)
+        style_state = self.style_replay_data_loader.get_next_data(K=K)
+
+        content_reference = self._build_auxiliary_reference_obs_from_fields(
+            content_state.root_pos,
+            content_state.root_quat,
+            content_state.motors,
+            content_state.link_pos,
+            content_state.link_vels,
+            content_state.contacts,
+            "auxiliary_content_reference",
+        )
+        style_reference = self._build_auxiliary_reference_obs_from_fields(
+            style_state.root_pos,
+            style_state.root_quat,
+            style_state.motors,
+            style_state.link_pos,
+            style_state.link_vels,
+            style_state.contacts,
+            "auxiliary_style_reference",
+        )
+
+        return {
+            "content_deepmimic": content_reference.detach(),
+            "style_deepmimic": style_reference.detach(),
+        }
+
     def compute_observations(self):
         obs = super().compute_observations()
         self.extras["discriminator"] = self._build_discriminator_observations()
+        auxiliary_observations = self._build_auxiliary_observations()
+        if auxiliary_observations is not None:
+            self.extras["auxiliary"] = auxiliary_observations
         return obs
 	        
 	    
@@ -327,7 +440,48 @@ class RobotDeepMimic(LeggedRobot):
         # Store the selected episode index for cycling
         self.selected_episode_idx = episode_idx
         self.selected_start_offset = start_offset
+        self.manual_style_pairing = False
         # Reset the environment to apply the new data
+        self.reset_idx(torch.tensor([0], device=self.device), already_reset_replay_data=True)
+
+    def get_style_transfer_clip_options(self):
+        """Return display labels and replay indices for content/style clip selectors."""
+        def _build_options(indices):
+            paths = self.replay_data_loader.get_pkl_paths()
+            options = []
+            for clip_idx in indices:
+                clip_path = paths[clip_idx]
+                clip_name = os.path.splitext(os.path.basename(str(clip_path)))[0]
+                options.append((f"{clip_idx:04d}: {clip_name}", clip_idx))
+            return options
+
+        all_indices = list(range(len(self.replay_data_loader.get_pkl_paths())))
+        content_indices = getattr(self.replay_data_loader, "content_sequence_indices", None) or all_indices
+        style_indices = getattr(self.replay_data_loader, "style_sequence_indices", None) or all_indices
+        return _build_options(content_indices), _build_options(style_indices)
+
+    def set_visualization_pair(self, content_episode_idx: int, style_episode_idx: int,
+                               content_start_offset: int = 0, style_start_offset: int = 0):
+        """
+        Set explicit content and style clips for the 0th visualization environment.
+
+        The content loader still drives the target motion used for tracking,
+        while the style loader supplies the stage-2 style observation stream.
+        """
+        if self.style_replay_data_loader is None:
+            print("Style transfer clip selection requested, but style conditioning is disabled.")
+            self.set_visualization_episode(content_episode_idx, content_start_offset)
+            return
+
+        print(
+            f"Setting content episode {content_episode_idx} at {content_start_offset}, "
+            f"style episode {style_episode_idx} at {style_start_offset}"
+        )
+        self.selected_episode_idx = int(content_episode_idx)
+        self.selected_start_offset = int(content_start_offset)
+        self.selected_style_episode_idx = int(style_episode_idx)
+        self.selected_style_start_offset = int(style_start_offset)
+        self.manual_style_pairing = True
         self.reset_idx(torch.tensor([0], device=self.device), already_reset_replay_data=True)
         
 
@@ -365,10 +519,27 @@ class RobotDeepMimic(LeggedRobot):
                     self.max_episode_length = self.replay_data_loader.reset(env_mask)
 
         if self.style_replay_data_loader is not None:
-            style_env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            style_env_mask[env_ids] = True
-            self.style_replay_data_loader.reset(style_env_mask)
-            self._sync_style_replay_data(env_ids)
+            manual_style_env0 = (
+                0 in env_ids
+                and getattr(self, "manual_style_pairing", False)
+                and hasattr(self, "selected_style_episode_idx")
+            )
+            style_env_ids = env_ids
+            if manual_style_env0:
+                style_env_ids = env_ids[env_ids != 0]
+
+            if len(style_env_ids) > 0:
+                style_env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                style_env_mask[style_env_ids] = True
+                self.style_replay_data_loader.reset(style_env_mask)
+                self._sync_style_replay_data(style_env_ids)
+
+            if manual_style_env0:
+                self.style_replay_data_loader.set_env_data(
+                    0,
+                    self.selected_style_episode_idx,
+                    self.selected_style_start_offset,
+                )
         
         self.reset_start_state = self.replay_data_loader.get_current_data()
 
@@ -435,8 +606,20 @@ class RobotDeepMimic(LeggedRobot):
         if not torch.isfinite(self.root_states[env_ids, 3:7]).all():
             print(f"root_states[:,3:7]: {torch.isfinite(self.root_states[env_ids, 3:7]).all()}")
         if self.cfg.deepmimic.init_velocities:
-            self.root_states[env_ids, 7:10] = self.reset_start_state.root_vel[env_ids]
-            self.root_states[env_ids, 10:13] = self.reset_start_state.root_ang_vel[env_ids]
+            root_vel = self.reset_start_state.root_vel[env_ids]
+            root_ang_vel = self.reset_start_state.root_ang_vel[env_ids]
+            bad_root_vel = ~torch.isfinite(root_vel).all(dim=1)
+            bad_root_ang_vel = ~torch.isfinite(root_ang_vel).all(dim=1)
+            if torch.any(bad_root_vel | bad_root_ang_vel):
+                bad_envs = env_ids[bad_root_vel | bad_root_ang_vel]
+                bad_clip_indices = self.reset_start_state.clip_index[bad_envs]
+                print(f"[DeepMimic] Non-finite reset root velocities for envs: {bad_envs.tolist()}, clips: {bad_clip_indices.tolist()}, zeroing root velocities")
+            root_vel = self._finite_tensor(root_vel)
+            root_ang_vel = self._finite_tensor(root_ang_vel)
+            root_vel[bad_root_vel] = 0.0
+            root_ang_vel[bad_root_ang_vel] = 0.0
+            self.root_states[env_ids, 7:10] = root_vel
+            self.root_states[env_ids, 10:13] = root_ang_vel
         else:
             self.root_states[env_ids, 7:10] = 0.0
             self.root_states[env_ids, 10:13] = 0.0
@@ -487,6 +670,10 @@ class RobotDeepMimic(LeggedRobot):
             return
         if env_ids is None or len(env_ids) == 0:
             return
+        if getattr(self, "manual_style_pairing", False) and 0 in env_ids:
+            env_ids = env_ids[env_ids != 0]
+            if len(env_ids) == 0:
+                return
         content_episode_indices = self.replay_data_loader.episode_indices[env_ids]
         content_start_offsets = self.replay_data_loader.index_within_episode[env_ids]
         for local_idx, env_id in enumerate(env_ids.tolist()):
@@ -518,15 +705,11 @@ class RobotDeepMimic(LeggedRobot):
         self._apply_stage_target_selection()
 
     def _apply_stage_target_selection(self):
-        use_style_targets = self.training_stage >= 2 and self.style_replay_data_loader is not None
-        active_prefix = 'style' if use_style_targets else 'content'
+        active_prefix = 'content'
 
         def _select(field_name):
             active_name = f'{active_prefix}_target_{field_name}'
-            content_name = f'content_target_{field_name}'
             value = getattr(self, active_name, None)
-            if value is None:
-                value = getattr(self, content_name, None)
             setattr(self, f'target_{field_name}', value)
 
         for field_name in [
@@ -1004,7 +1187,7 @@ class RobotDeepMimic(LeggedRobot):
     
     def _obs_torso_yaw(self):
         torso_quat = self.rigid_body_quat[:, self.torso_index]
-        return self._validate_obs_tensor(calc_heading(torso_quat), 'torso_yaw')
+        return self._validate_obs_tensor(calc_heading(torso_quat).view(-1, 1), 'torso_yaw')
     
 
     def _obs_target_joints(self):
@@ -1082,7 +1265,7 @@ class RobotDeepMimic(LeggedRobot):
 
 
         heading_expand_vels = heading.unsqueeze(1).repeat(1, num_tracked_links, 1).view(self.num_envs * num_tracked_links, 4)
-        link_vels_global = self.rigid_body_vel[:, self.tracked_body_indices]
+        link_vels_global = target_link_vel[:, 0] if target_link_vel.dim() == 4 else target_link_vel
         obs_link_vel = quat_rotate(heading_expand_vels, link_vels_global.view(self.num_envs * num_tracked_links, 3)).view(self.num_envs, num_tracked_links, 3)
 
         obs = torch.cat((
@@ -1226,6 +1409,12 @@ class RobotDeepMimic(LeggedRobot):
             [torch.Tensor]: Torques sent to the simulation
         """
         #pd controller
+        assert actions.shape == self.dof_pos.shape, (actions.shape, self.dof_pos.shape)
+        assert self.num_actions == self.num_dof, (self.num_actions, self.num_dof)
+        assert torch.isfinite(actions).all()
+        assert torch.isfinite(self.dof_pos).all()
+        assert torch.isfinite(self.dof_vel).all()
+
         actions_scaled = actions * self.cfg.control.action_scale
         control_type = self.cfg.control.control_type
         if control_type in ['P', 'V', 'T', 'DIRECT']:
