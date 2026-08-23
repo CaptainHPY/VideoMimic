@@ -264,6 +264,8 @@ class LeggedRobot(BaseTask):
 
         self._resample_episodic_randomisations(env_ids)
 
+        episode_duration_s = torch.clamp(self.episode_length_buf[env_ids].float() * self.dt, min=self.dt)
+
         # reset buffers
         self.actions[env_ids] = 0.
         self.last_actions[env_ids] = 0.
@@ -275,8 +277,11 @@ class LeggedRobot(BaseTask):
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
-            self.extras["episode"]['Episode/rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
+            episode_sums = self.episode_sums[key][env_ids]
+            self.extras["episode"]['Episode/rew_' + key] = torch.mean(episode_sums) / self.max_episode_length_s
+            self.extras["episode"]['EpisodePerSecond/rew_' + key] = torch.mean(episode_sums / episode_duration_s)
             self.episode_sums[key][env_ids] = 0.
+        self._fill_episode_diagnostics(env_ids)
         if self.cfg.commands.curriculum:
             self.extras["episode"]["Episode/max_command_x"] = self.command_ranges["lin_vel_x"][1]
         # send timeout info to the algorithm
@@ -288,6 +293,10 @@ class LeggedRobot(BaseTask):
         
         for sensor_name, sensor in self.sensors.items():
             sensor.reset(env_ids)
+
+    def _fill_episode_diagnostics(self, env_ids):
+        """Add subclass-specific episode diagnostics before reset buffers are cleared."""
+        pass
     
     def compute_reward(self):
         """ Compute rewards

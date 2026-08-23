@@ -182,8 +182,8 @@ class G1DeepMimicRewardScalesCfg:
 
     lin_vel_z = 0.0
     ang_vel_xy = 0.00
-    orientation = 1.0
-    base_height = 1.0
+    orientation = -8.0 #-12.0
+    base_height = -8.0 #-12.0
     
     # regularisation terms
     dof_acc = 0.0 #-1e-6 / 3.0 
@@ -197,13 +197,13 @@ class G1DeepMimicRewardScalesCfg:
 
     no_fly = 0.0#-50.0
 
-    collision = -15.0
+    collision = -10.0
 
     dof_pos_limits = -50.0
-    alive = 1.0
+    alive = 4.0
     hip_pos = 0.0 #-1.0
-    # contact_no_vel = -5.0
-    contact_no_vel = -100.0
+    contact_no_vel = -5.0
+    # contact_no_vel = -100.0
     feet_swing_height = 0.0
     contact = 0.0
 
@@ -212,15 +212,15 @@ class G1DeepMimicRewardScalesCfg:
     root_vel_tracking = 0.0
     root_ang_vel_tracking = 0.0
 
-    joint_pos_tracking = 120.0
-    link_pos_tracking = 30.0
+    joint_pos_tracking = 80.0 #95.0
+    link_pos_tracking = 20.0 #24.0
     root_pos_tracking = 1.0
     torso_pos_tracking = 15.0
     root_orientation_tracking = 15.0
     torso_orientation_tracking = 15.0
 
     link_vel_tracking = 5.0
-    joint_vel_tracking = 24.0
+    joint_vel_tracking = 16.0 #18.0
 
 
     feet_contact_matching = 1.0 
@@ -231,7 +231,7 @@ class G1DeepMimicRewardScalesCfg:
     termination= -500.0
     # termination= -0.0
     
-    feet_air_time = 2000.0
+    feet_air_time = 0.0
 
 
 @configclass
@@ -728,6 +728,8 @@ class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
     freeze_style_branch = False
     style_lr_scale = 0.1
     content_lr_scale = 0.2
+    head_lr_scale = 1.0
+    base_lr_scale = 1.0
     style_lr_warmup_steps = 5000
 
     @configclass
@@ -1293,7 +1295,7 @@ class G1DeepMimicCfgPPO(LeggedRobotCfgPPO):
     runner = LeggedRobotRunnerCfg(
         max_iterations = 100000,
         experiment_name = 'g1_deepmimic',
-        save_interval = 10000,
+        save_interval = 2000,
         # policy_class_name = 'ActorCriticRecurrent',
     )
 

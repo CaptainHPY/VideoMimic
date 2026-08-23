@@ -115,7 +115,7 @@ class RobotDeepMimic(LeggedRobot):
             self.style_replay_data_loader.reset(torch.ones(self.num_envs, dtype=torch.bool, device=self.device))
         self.update_replay_data()
         if self.style_replay_data_loader is not None:
-            self._sync_style_replay_data(torch.arange(self.num_envs, device=self.device))
+            self._update_style_replay_data()
 
         self.camera_set = False
         self.env_offsets = self.terrain.get_terrain_offset(self.replay_data_loader.episode_indices)
@@ -532,7 +532,6 @@ class RobotDeepMimic(LeggedRobot):
                 style_env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
                 style_env_mask[style_env_ids] = True
                 self.style_replay_data_loader.reset(style_env_mask)
-                self._sync_style_replay_data(style_env_ids)
 
             if manual_style_env0:
                 self.style_replay_data_loader.set_env_data(
@@ -807,19 +806,43 @@ class RobotDeepMimic(LeggedRobot):
         self.last_target_contact = target_contact
 
     def check_termination(self):
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        termination_contact_names = getattr(self.cfg.asset, "terminate_after_contacts_on", [])
+        has_termination_contacts = len(termination_contact_names) > 0 and len(self.termination_contact_indices) > 0
+        if has_termination_contacts:
+            termination_contact = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        else:
+            termination_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        reset_buf = termination_contact.clone()
         link_pos_error = torch.norm(self.link_pos_error, dim=-1)
+        max_link_pos_error = torch.max(link_pos_error, dim=1).values
         link_pos_error_threshold = self.cfg.deepmimic.link_pos_error_threshold
-        self.reset_buf |= torch.any(link_pos_error > link_pos_error_threshold, dim=1) & (self.episode_length_buf >= 2)
+        link_pos_error_done = (max_link_pos_error > link_pos_error_threshold) & (self.episode_length_buf >= 2)
+        reset_buf |= link_pos_error_done
         self._compute_invalid_changes()
 
         if self.cfg.asset.terminate_after_large_feet_contact_forces:
-            self.reset_buf |= torch.any(torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) > self.cfg.asset.large_feet_contact_force_threshold, dim=1)
-
-        self.reset_buf |= torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+            reset_buf |= torch.any(torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) > self.cfg.asset.large_feet_contact_force_threshold, dim=1)
 
         self.time_out_buf = self.episode_length_buf >= self.max_episode_length
-        self.reset_buf |= self.time_out_buf
+        reset_buf |= self.time_out_buf
+        self.reset_buf = reset_buf
+        self.done_link_pos_error = link_pos_error_done
+        self.done_termination_contact = termination_contact
+        self.done_timeout = self.time_out_buf
+        self.done_max_link_pos_error = max_link_pos_error
+        self.done_termination_contact_config_count = len(termination_contact_names)
+        self.done_termination_contact_index_count = len(self.termination_contact_indices)
+
+    def _fill_episode_diagnostics(self, env_ids):
+        super()._fill_episode_diagnostics(env_ids)
+        if not hasattr(self, "done_link_pos_error"):
+            return
+        self.extras["episode"]["Done/link_pos_error"] = self.done_link_pos_error[env_ids].float().mean()
+        self.extras["episode"]["Done/termination_contact"] = self.done_termination_contact[env_ids].float().mean()
+        self.extras["episode"]["Done/timeout"] = self.done_timeout[env_ids].float().mean()
+        self.extras["episode"]["max_link_pos_error"] = self.done_max_link_pos_error[env_ids].mean()
+        self.extras["episode"]["Done/termination_contact_config_count"] = self.done_termination_contact_config_count
+        self.extras["episode"]["Done/termination_contact_index_count"] = self.done_termination_contact_index_count
 
     def _compute_link_pos_error(self):
         return self.env_rigid_body_pos[:, self.tracked_body_indices] - self.target_link_pos
