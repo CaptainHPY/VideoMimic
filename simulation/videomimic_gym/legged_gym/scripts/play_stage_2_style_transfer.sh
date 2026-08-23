@@ -4,7 +4,7 @@ SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pw
 cd "$SCRIPT_DIR/../.."
 
 # Replace this with the stage-2 run directory you want to inspect.
-LOAD_RUN=20260630_225252_g1_deepmimic
+LOAD_RUN=20260806_203708_g1_deepmimic
 
 python legged_gym/scripts/play.py \
 --task=g1_deepmimic \
