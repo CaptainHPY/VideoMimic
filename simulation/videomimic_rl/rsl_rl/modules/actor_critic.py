@@ -213,7 +213,7 @@ class StyleTransformer(nn.Module):
         # decoder query and motion decoder used to generate the style-transferred motion tokens
         self.decoder_query = nn.Parameter(torch.randn(num_parts, part_dim))
         self.decoder = TransformerDecoder(part_dim, num_heads=num_heads, num_layers=num_dec_layers, num_parts=num_parts)
-        self.content_decoder_gate = nn.Parameter(torch.tensor(-4.0))
+        self.content_decoder_gate = nn.Parameter(torch.tensor(0.0))
         self.style_decoder_gate = nn.Parameter(torch.tensor(-4.0))
 
         # learnable style tokens, one token per body part, matching class.py
@@ -298,17 +298,15 @@ class StyleTransformer(nn.Module):
 
         if content_only:
             generated_feature = self.out_proj(generated_motion)
-            decoder_gate = torch.sigmoid(self.content_decoder_gate)
-            weighted_generated_feature = decoder_gate * generated_feature
-            output = cnt + weighted_generated_feature
-            self._record_generated_feature_contribution(weighted_generated_feature, output)
+            gate = torch.sigmoid(self.content_decoder_gate)
+            output = (1 - gate) * cnt + gate * generated_feature
+            self._record_generated_feature_contribution(gate * generated_feature, output)
             return output
 
         styled = self.out_proj(generated_motion)
         gate = torch.sigmoid(self.style_decoder_gate)
-        weighted_style_delta = gate * (styled - cnt)
-        output = cnt + weighted_style_delta
-        self._record_generated_feature_contribution(weighted_style_delta, output)
+        output = (1 - gate) * cnt + gate * styled
+        self._record_generated_feature_contribution(gate * styled, output)
         return output
 
 
@@ -432,6 +430,8 @@ class ActorCritic(nn.Module):
                         freeze_style_branch=False,
                         style_lr_scale=0.1,
                         content_lr_scale=0.2,
+                        head_lr_scale=1.0,
+                        base_lr_scale=1.0,
                         style_lr_warmup_steps=5000,
                         style_num_parts=6,
                         style_part_dim=None,
@@ -453,10 +453,12 @@ class ActorCritic(nn.Module):
         self.env_num_actions = num_actions
         self.stage = stage
         self._freeze_style_branch_override = bool(freeze_style_branch)
-        self.freeze_style_branch = bool(freeze_style_branch) or self.stage == 1
-        self.use_style_stream = self.stage >= 2 and not self.freeze_style_branch
+        self.freeze_style_branch = bool(freeze_style_branch)
+        self.use_style_stream = not self.freeze_style_branch
         self.style_lr_scale = float(style_lr_scale)
         self.content_lr_scale = float(content_lr_scale)
+        self.head_lr_scale = float(head_lr_scale)
+        self.base_lr_scale = float(base_lr_scale)
         self.style_lr_warmup_steps = int(style_lr_warmup_steps)
 
         actor_shared_shapes, actor_shared_spec, actor_stream_shapes, actor_stream_spec = _split_obs_streams(obs_shapes, obs_proc_actor)
@@ -508,9 +510,9 @@ class ActorCritic(nn.Module):
         self.actor_stream_fallback = nn.Parameter(torch.zeros(actor_style_dim)) if actor_style_dim is not None else None
         self.critic_stream_fallback = nn.Parameter(torch.zeros(critic_style_dim)) if critic_style_dim is not None else None
 
-        # Keep the MLP input width fixed to the full stream layout. When style
-        # is disabled we will feed a zero vector placeholder so the policy head
-        # always sees the same concatenated size.
+        # Keep the MLP input width fixed to the full stream layout. When the
+        # style stream is unavailable or disabled, feed a zero placeholder so
+        # the policy head always sees the same concatenated size.
         mlp_input_dim_a = sum(self.actor_stream_dims.values())
         mlp_input_dim_c = sum(self.critic_stream_dims.values())
 
@@ -602,7 +604,7 @@ class ActorCritic(nn.Module):
         return "base"
 
     def _apply_stage_freeze(self):
-        freeze_generation = self.stage == 1 or self._freeze_style_branch_override
+        freeze_generation = self.freeze_style_branch
         for name, param in self.named_parameters():
             if freeze_generation and self._is_generation_param_name(name):
                 param.requires_grad = False
@@ -611,8 +613,8 @@ class ActorCritic(nn.Module):
 
     def set_stage(self, stage: int):
         self.stage = int(stage)
-        self.freeze_style_branch = self._freeze_style_branch_override or self.stage == 1
-        self.use_style_stream = self.stage >= 2 and not self.freeze_style_branch
+        self.freeze_style_branch = self._freeze_style_branch_override
+        self.use_style_stream = not self.freeze_style_branch
         self._apply_stage_freeze()
 
     def get_style_lr_scale(self, current_learning_iteration: int) -> float:
@@ -624,11 +626,13 @@ class ActorCritic(nn.Module):
 
     def get_optimizer_lr_scales(self, current_learning_iteration: int) -> Dict[str, float]:
         content_lr_scale = self.content_lr_scale if self.stage >= 2 else 1.0
+        head_lr_scale = self.head_lr_scale if self.stage >= 2 else 1.0
+        base_lr_scale = self.base_lr_scale if self.stage >= 2 else 1.0
         return {
-            "base": 1.0,
+            "base": base_lr_scale,
             "content": content_lr_scale,
             "style": self.get_style_lr_scale(current_learning_iteration),
-            "head": 1.0,
+            "head": head_lr_scale,
         }
 
     def get_and_reset_generated_feature_contribution_stats(self) -> Dict[str, Dict[str, float]]:
@@ -841,7 +845,7 @@ class ActorCritic(nn.Module):
             backbone_key = f"{module_prefix}style_backbone"
         backbone = stream_modules[backbone_key] if backbone_key in stream_modules else None
 
-        if backbone is not None and not self.stage == 1:
+        if backbone is not None and self.use_style_stream:
             fused = backbone(content_feat, sty=style_feat, content_only=False)
         else:
             fused = content_feat
@@ -1003,15 +1007,13 @@ class ActorCritic(nn.Module):
                 extra_proj_outputs.extend(content_extra)
 
             style_feat, style_extra = self._encode_stream(self.actor_stream_modules, "actor_", "style_", observations)
-            if self.use_style_stream:
-                if style_feat is not None:
-                    features.append(style_feat)
+            style_dim = self.actor_stream_dims.get("style_")
+            if self.use_style_stream and style_feat is not None:
+                features.append(style_feat)
                 if style_extra is not None:
                     extra_proj_outputs.extend(style_extra)
-            else:
-                style_dim = self.actor_stream_dims.get("style_")
-                if style_dim is not None:
-                    features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.actor_stream_fallback))
+            elif style_dim is not None:
+                features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.actor_stream_fallback))
 
         if len(features) == 0:
             return None, None
@@ -1049,15 +1051,13 @@ class ActorCritic(nn.Module):
                 extra_proj_outputs.extend(content_extra)
 
             style_feat, style_extra = self._encode_stream(self.critic_stream_modules, "critic_", "style_", observations)
-            if self.use_style_stream:
-                if style_feat is not None:
-                    features.append(style_feat)
+            style_dim = self.critic_stream_dims.get("style_")
+            if self.use_style_stream and style_feat is not None:
+                features.append(style_feat)
                 if style_extra is not None:
                     extra_proj_outputs.extend(style_extra)
-            else:
-                style_dim = self.critic_stream_dims.get("style_")
-                if style_dim is not None:
-                    features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.critic_stream_fallback))
+            elif style_dim is not None:
+                features.append(self._make_zero_stream_feature(reference_tensor, style_dim, self.critic_stream_fallback))
 
         if len(features) == 0:
             return None, None
