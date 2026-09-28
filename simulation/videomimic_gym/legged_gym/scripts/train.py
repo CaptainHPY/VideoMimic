@@ -21,6 +21,11 @@ def train(args, unknown):
         print(f"After loading checkpoint, re-initializing std with value {train_cfg.policy.init_noise_std}")
         ppo_runner.alg.actor_critic.re_init_std(train_cfg.policy.init_noise_std)
 
+    if hasattr(train_cfg.policy, 're_init_style_decoder_gate') and train_cfg.policy.re_init_style_decoder_gate:
+        gate_logit = train_cfg.policy.style_decoder_gate_init
+        print(f"After loading checkpoint, re-initializing style decoder gate logits with value {gate_logit}")
+        ppo_runner.alg.actor_critic.re_init_style_decoder_gates(gate_logit)
+
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=False)
 
 if __name__ == '__main__':

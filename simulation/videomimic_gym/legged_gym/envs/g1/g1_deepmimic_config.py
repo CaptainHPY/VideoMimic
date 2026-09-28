@@ -141,8 +141,9 @@ class LeggedRobotDeepMimicCfg:
     use_style_conditioning = False
     # Training stage: 1 = content-only, 2 = content + style.
     stage = 1
-    # Pairing rule for style clips when style conditioning is enabled: "style" or "content".
-    style_pair_relation = 'style'
+    # Pairing rule for style clips when style conditioning is enabled:
+    # "random", "style" (same style, different content), or "content" (same content, different style).
+    style_pair_relation = 'random'
 
 @configclass
 class LeggedRobotDeepMimicTerrainCfg(LeggedRobotTerrainCfg):
@@ -200,7 +201,7 @@ class G1DeepMimicRewardScalesCfg:
     collision = -10.0
 
     dof_pos_limits = -50.0
-    alive = 4.0
+    alive = 8.0
     hip_pos = 0.0 #-1.0
     contact_no_vel = -5.0
     # contact_no_vel = -100.0
@@ -731,6 +732,8 @@ class G1DeepMimicPolicyCfg(LeggedRobotPolicyCfg):
     head_lr_scale = 1.0
     base_lr_scale = 1.0
     style_lr_warmup_steps = 5000
+    re_init_style_decoder_gate = False
+    style_decoder_gate_init = 0.0
 
     @configclass
     class ObsProcActor:
@@ -1276,9 +1279,11 @@ class G1DeepMimicAlgorithmCfg(LeggedRobotAlgorithmCfg):
     discriminator_hidden_dim: int = 256
     discriminator_num_heads: int = 4
     discriminator_num_layers: int = 2
-    discriminator_learning_rate: float = 1.e-4
+    discriminator_learning_rate: float = 2.e-6
     discriminator_updates_per_iter: int = 1
+    discriminator_update_interval: int = 1
     discriminator_r1_coef: float = 10.0
+    discriminator_mismatched_style_coef: float = 1.0
     discriminator_reward_coef: float = 0.0
     discriminator_recon_coef: float = 0.0
     discriminator_cycle_content_coef: float = 0.0
@@ -1287,6 +1292,21 @@ class G1DeepMimicAlgorithmCfg(LeggedRobotAlgorithmCfg):
     auxiliary_recon_loss_coef: float = 0.0
     auxiliary_cycle_content_loss_coef: float = 0.0
     auxiliary_cycle_style_loss_coef: float = 0.0
+    auxiliary_style_consistency_loss_coef: float = 0.0
+    auxiliary_style_contrastive_loss_coef: float = 0.0
+    auxiliary_style_contrastive_margin: float = 0.2
+    auxiliary_style_norm_loss_coef: float = 0.0
+    style_gradient_monitor_interval: int = 0
+    use_latent_discriminator: bool = False
+    latent_discriminator_hidden_dim: int = 256
+    latent_discriminator_learning_rate: float = 1.e-5
+    latent_discriminator_update_interval: int = 1
+    latent_discriminator_mismatched_style_coef: float = 1.0
+    latent_discriminator_ce_coef: float = 1.0
+    latent_aux_adversarial_coef: float = 0.0
+    latent_aux_ce_coef: float = 1.0
+    latent_discriminator_warmup_steps: int = 500
+    latent_aux_adversarial_ramp_steps: int = 500
 
 @configclass
 class G1DeepMimicCfgPPO(LeggedRobotCfgPPO):
