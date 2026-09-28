@@ -164,6 +164,13 @@ class OnPolicyRunner:
             model_params = [self.alg.actor_critic.state_dict()]
             dist.broadcast_object_list(model_params, 0)
             self.alg.actor_critic.load_state_dict(model_params[0])
+            iteration = torch.tensor(
+                [self.current_learning_iteration],
+                dtype=torch.long,
+                device=self.device,
+            )
+            dist.broadcast(iteration, 0)
+            self.current_learning_iteration = int(iteration.item())
 
 
         start_iter = self.current_learning_iteration
@@ -196,7 +203,7 @@ class OnPolicyRunner:
 
             # Learning step
             start = stop
-            self.alg.compute_returns(obs)
+            self.alg.compute_returns(obs, current_learning_iteration=it)
             
             mean_value_loss, mean_surrogate_loss, mean_bc_loss, mean_bounds_loss = self.alg.update(it)
             stop = time.time()
@@ -290,9 +297,15 @@ class OnPolicyRunner:
         discriminator_stats = getattr(self.alg, "last_discriminator_stats", {})
         for key, value in discriminator_stats.items():
             add_scalar(f'Discriminator/{key}', value, locs['it'])
+        latent_discriminator_stats = getattr(self.alg, "last_latent_discriminator_stats", {})
+        for key, value in latent_discriminator_stats.items():
+            add_scalar(f'LatentDiscriminator/{key}', value, locs['it'])
         auxiliary_loss_stats = getattr(self.alg, "last_auxiliary_loss_stats", {})
         for key, value in auxiliary_loss_stats.items():
             add_scalar(f'Auxiliary/{key}', value, locs['it'])
+        style_gradient_stats = getattr(self.alg, "last_style_gradient_stats", {})
+        for key, value in style_gradient_stats.items():
+            add_scalar(f'GradientNorm/style/{key}', value, locs['it'])
         add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
         add_scalar('Perf/total_fps', fps, locs['it'])
         add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
@@ -300,12 +313,23 @@ class OnPolicyRunner:
         if hasattr(self.alg.actor_critic, "get_and_reset_generated_feature_contribution_stats"):
             contribution_stats = self.alg.actor_critic.get_and_reset_generated_feature_contribution_stats()
             contribution_values = []
+            mixture_share_values = []
             for module_name, stats in contribution_stats.items():
                 contribution_values.append(stats['contribution_ratio'])
+                mixture_share_values.append(stats['mixture_share'])
                 add_scalar(f'Network/generated_feature_contribution/{module_name}', stats['contribution_ratio'], locs['it'])
+                add_scalar(f'Network/generated_feature_mixture_share/{module_name}', stats['mixture_share'], locs['it'])
                 add_scalar(f'Network/generated_feature_contribution_forwards/{module_name}', stats['num_forwards'], locs['it'])
             if len(contribution_values) > 0:
                 add_scalar('Network/generated_feature_contribution_mean', sum(contribution_values) / len(contribution_values), locs['it'])
+                add_scalar('Network/generated_feature_mixture_share_mean', sum(mixture_share_values) / len(mixture_share_values), locs['it'])
+        style_sensitivity_stats = getattr(self.alg, "last_style_sensitivity_stats", {})
+        for key, value in style_sensitivity_stats.items():
+            add_scalar(f'Network/{key}', value, locs['it'])
+        if hasattr(self.alg.actor_critic, "get_decoder_gate_stats"):
+            for module_name, stats in self.alg.actor_critic.get_decoder_gate_stats().items():
+                add_scalar(f'Network/content_decoder_gate/{module_name}', stats['content'], locs['it'])
+                add_scalar(f'Network/style_decoder_gate/{module_name}', stats['style'], locs['it'])
         if len(locs['rewbuffer']) > 0:
             add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
@@ -397,6 +421,16 @@ class OnPolicyRunner:
             checkpoint['discriminator_state_dict'] = self.alg.discriminator.state_dict()
         if getattr(self.alg, "discriminator_optimizer", None) is not None:
             checkpoint['discriminator_optimizer_state_dict'] = self.alg.discriminator_optimizer.state_dict()
+        if getattr(self.alg, "latent_discriminator", None) is not None:
+            checkpoint['latent_discriminator_state_dict'] = self.alg.latent_discriminator.state_dict()
+        if getattr(self.alg, "latent_discriminator_optimizer", None) is not None:
+            checkpoint['latent_discriminator_optimizer_state_dict'] = self.alg.latent_discriminator_optimizer.state_dict()
+        checkpoint['latent_stage2_start_iteration'] = getattr(
+            self.alg, "_latent_stage2_start_iteration", None
+        )
+        checkpoint['latent_stage2_iteration'] = getattr(
+            self.alg, "_latent_stage2_iteration", 0
+        )
         torch.save(checkpoint, path)
         if self.cfg['use_wandb'] and not self.disable_logs:
             import wandb
@@ -419,6 +453,30 @@ class OnPolicyRunner:
             self.alg.load_discriminator_state_dict(
                 loaded_dict['discriminator_state_dict'],
                 discriminator_optimizer_state_dict,
+            )
+        if (
+            'latent_discriminator_state_dict' in loaded_dict
+            and hasattr(self.alg, "load_latent_discriminator_state_dict")
+        ):
+            latent_discriminator_optimizer_state_dict = (
+                loaded_dict.get('latent_discriminator_optimizer_state_dict', None)
+                if load_optimizer else None
+            )
+            self.alg.load_latent_discriminator_state_dict(
+                loaded_dict['latent_discriminator_state_dict'],
+                latent_discriminator_optimizer_state_dict,
+            )
+        if 'latent_stage2_start_iteration' in loaded_dict:
+            self.alg._latent_stage2_start_iteration = loaded_dict[
+                'latent_stage2_start_iteration'
+            ]
+        if 'latent_stage2_iteration' in loaded_dict:
+            self.alg._latent_stage2_iteration = loaded_dict['latent_stage2_iteration']
+        elif self.alg._latent_stage2_start_iteration is not None:
+            self.alg._latent_stage2_iteration = max(
+                0,
+                int(loaded_dict['iter'])
+                - int(self.alg._latent_stage2_start_iteration),
             )
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
