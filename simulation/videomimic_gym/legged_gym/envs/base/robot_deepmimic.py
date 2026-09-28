@@ -80,7 +80,7 @@ class RobotDeepMimic(LeggedRobot):
         )
         self.training_stage = cfg.deepmimic.stage if hasattr(cfg.deepmimic, 'stage') else 1
         self.use_style_conditioning = self.training_stage >= 2
-        self.style_pair_relation = cfg.deepmimic.style_pair_relation if hasattr(cfg.deepmimic, 'style_pair_relation') else 'style'
+        self.style_pair_relation = cfg.deepmimic.style_pair_relation if hasattr(cfg.deepmimic, 'style_pair_relation') else 'random'
         self.style_replay_data_loader = None
         if self.use_style_conditioning:
             self.style_replay_data_loader = ReplayDataLoader(
@@ -113,6 +113,7 @@ class RobotDeepMimic(LeggedRobot):
         self.ep_lengths = self.replay_data_loader.reset(torch.ones(self.num_envs, dtype=torch.bool, device=self.device))
         if self.style_replay_data_loader is not None:
             self.style_replay_data_loader.reset(torch.ones(self.num_envs, dtype=torch.bool, device=self.device))
+            self._sync_style_replay_data(torch.arange(self.num_envs, device=self.device))
         self.update_replay_data()
         if self.style_replay_data_loader is not None:
             self._update_style_replay_data()
@@ -124,11 +125,12 @@ class RobotDeepMimic(LeggedRobot):
         self.viz_replay_sync_robot = cfg.deepmimic.viz_replay_sync_robot if hasattr(cfg.deepmimic, 'viz_replay_sync_robot') else False
 
         if self.use_viser_viz:
-            available_episodes = self.get_available_episodes()
-            self.viser_viz.setup_clip_selection(available_episodes)
             if self.style_replay_data_loader is not None and hasattr(self.viser_viz, "setup_style_transfer_clip_selection"):
                 content_clips, style_clips = self.get_style_transfer_clip_options()
                 self.viser_viz.setup_style_transfer_clip_selection(content_clips, style_clips)
+            else:
+                available_episodes = self.get_available_episodes()
+                self.viser_viz.setup_clip_selection(available_episodes)
     
     def _init_buffers(self):
         super()._init_buffers()
@@ -187,6 +189,7 @@ class RobotDeepMimic(LeggedRobot):
         return value
 
     def _build_discriminator_observations(self):
+        label_loader = self.style_replay_data_loader or self.replay_data_loader
         generated_motion = self._build_discriminator_motion_state(
             self.env_root_pos,
             self.root_states[:, 3:7],
@@ -215,9 +218,15 @@ class RobotDeepMimic(LeggedRobot):
             "generated_motion": generated_motion.detach(),
             "content_motion": content_motion.detach(),
             "style_motion": style_motion.detach(),
-            "content_condition": self.obs_dict.get("content_deepmimic", self.obs_dict.get("deepmimic")).detach(),
-            "style_condition": self.obs_dict.get("style_deepmimic", self.obs_dict.get("deepmimic")).detach(),
             "valid_mask": (~self.reset_buf).float().unsqueeze(-1).detach(),
+            "style_label": label_loader.get_style_labels().detach(),
+            "style_clip_index": label_loader.episode_indices.detach(),
+            "style_label_count": torch.full(
+                (self.num_envs,),
+                label_loader.num_style_labels,
+                dtype=torch.long,
+                device=self.device,
+            ),
         }
 
         if hasattr(self, "feet_indices"):
@@ -303,6 +312,26 @@ class RobotDeepMimic(LeggedRobot):
         if self.style_replay_data_loader is None:
             return None
 
+        style_metadata = {
+            "style_label": self.style_replay_data_loader.get_style_labels().detach(),
+            "style_clip_index": self.style_replay_data_loader.episode_indices.detach(),
+            "style_content_id": self.style_replay_data_loader.get_content_ids().detach(),
+            "style_label_count": torch.full(
+                (self.num_envs,),
+                self.style_replay_data_loader.num_style_labels,
+                dtype=torch.long,
+                device=self.device,
+            ),
+        }
+        content_deepmimic = self.obs_dict.get("content_deepmimic")
+        style_deepmimic = self.obs_dict.get("style_deepmimic")
+        if content_deepmimic is not None and style_deepmimic is not None:
+            return {
+                "content_deepmimic": content_deepmimic.detach(),
+                "style_deepmimic": style_deepmimic.detach(),
+                **style_metadata,
+            }
+
         K = self.cfg.deepmimic.num_next_obs
         content_state = self.replay_data_loader.get_next_data(K=K)
         style_state = self.style_replay_data_loader.get_next_data(K=K)
@@ -329,6 +358,7 @@ class RobotDeepMimic(LeggedRobot):
         return {
             "content_deepmimic": content_reference.detach(),
             "style_deepmimic": style_reference.detach(),
+            **style_metadata,
         }
 
     def compute_observations(self):
@@ -532,6 +562,7 @@ class RobotDeepMimic(LeggedRobot):
                 style_env_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
                 style_env_mask[style_env_ids] = True
                 self.style_replay_data_loader.reset(style_env_mask)
+                self._sync_style_replay_data(style_env_ids)
 
             if manual_style_env0:
                 self.style_replay_data_loader.set_env_data(
@@ -666,6 +697,8 @@ class RobotDeepMimic(LeggedRobot):
 
     def _sync_style_replay_data(self, env_ids):
         if self.style_replay_data_loader is None:
+            return
+        if self.style_pair_relation == "random":
             return
         if env_ids is None or len(env_ids) == 0:
             return

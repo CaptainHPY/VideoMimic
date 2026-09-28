@@ -827,6 +827,24 @@ class ReplayDataLoader:
             self.style_to_clip_indices.setdefault(clip_meta["style_name"], []).append(clip_idx)
             self.content_to_clip_indices.setdefault(clip_meta["content_id"], []).append(clip_idx)
 
+        # Use a deterministic vocabulary so independently constructed content
+        # and style replay loaders assign the same integer to each style name.
+        self.style_names = sorted(self.style_to_clip_indices.keys())
+        self.style_name_to_id = {
+            style_name: style_id for style_id, style_name in enumerate(self.style_names)
+        }
+        self.clip_style_ids = torch.full(
+            (self.num_clips,), -1, dtype=torch.long, device=self.device
+        )
+        self.clip_content_ids = torch.full(
+            (self.num_clips,), -1, dtype=torch.long, device=self.device
+        )
+        for clip_idx, clip_meta in enumerate(self.clip_metadata):
+            if clip_meta is not None:
+                self.clip_style_ids[clip_idx] = self.style_name_to_id[clip_meta["style_name"]]
+                self.clip_content_ids[clip_idx] = clip_meta["content_id"]
+        self.num_style_labels = len(self.style_names)
+
         self.content_sequence_indices = []
         self.style_sequence_indices = []
         for clip_idx, clip_meta in enumerate(self.clip_metadata):
@@ -858,6 +876,18 @@ class ReplayDataLoader:
         else:
             self.content_sequence_paths = list(self._pkl_paths)
             self.style_sequence_paths = list(self._pkl_paths)
+
+    def get_style_labels(self, episode_indices=None):
+        """Return filename-derived style ids for the requested replay clips."""
+        if episode_indices is None:
+            episode_indices = self.episode_indices
+        return self.clip_style_ids[episode_indices.long()]
+
+    def get_content_ids(self, episode_indices=None):
+        """Return filename-derived content ids for the requested replay clips."""
+        if episode_indices is None:
+            episode_indices = self.episode_indices
+        return self.clip_content_ids[episode_indices.long()]
 
     def _precompute_sampling_weights(self):
         """
