@@ -424,6 +424,8 @@ class LeggedRobotViser:
         self.style_clip_selection = None
         self.content_clip_start_offset = None
         self.style_clip_start_offset = None
+        self.phase_start_offset = None
+        self.use_kinematic_replay = None
 
         @self.show_robot.on_update
         def _(_) -> None:
@@ -726,6 +728,18 @@ class LeggedRobotViser:
                     initial_value=0,
                     hint="Select the style clip starting frame"
                 )
+                self.phase_start_offset = self.server.gui.add_slider(
+                    "Phase Start Frame",
+                    min=0,
+                    max=1000,
+                    step=1,
+                    initial_value=0,
+                    hint="Select starting frame in the clip"
+                )
+                self.use_kinematic_replay = self.server.gui.add_checkbox(
+                    "Use Kinematic Replay", initial_value=False,
+                    hint="Toggle between kinematic replay and physics simulation"
+                )
 
             @self.content_clip_selection.on_update
             def _(event) -> None:
@@ -742,6 +756,27 @@ class LeggedRobotViser:
             @self.style_clip_start_offset.on_update
             def _(event) -> None:
                 self.select_style_transfer_pair()
+
+            @self.phase_start_offset.on_update
+            def _(event) -> None:
+                self.robot.phase_offset = self.phase_start_offset.value
+
+            @self.use_kinematic_replay.on_update
+            def _(_) -> None:
+                if hasattr(self, 'robot'):
+                    self.robot.viz_replay_sync_robot = self.use_kinematic_replay.value
+
+            @self.server.on_client_connect
+            def _(client: viser.ClientHandle) -> None:
+                if hasattr(self.robot, 'env_offsets'):
+                    current_state = self.robot.replay_data_loader.get_current_data()
+                    env_offset = self.robot.env_offsets[0].cpu().numpy()
+                    root_pos = current_state.root_pos[0].cpu().numpy()
+
+                    camera_pos, lookat_pos = self.get_camera_position_for_robot(env_offset, root_pos)
+                    client.camera.position = camera_pos
+                    client.camera.look_at = lookat_pos
+                    self.robot.set_viewer_camera(camera_pos, lookat_pos)
 
             self.select_style_transfer_pair()
         else:
