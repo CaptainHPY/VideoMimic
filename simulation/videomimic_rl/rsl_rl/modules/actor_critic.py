@@ -192,7 +192,16 @@ class StyleTransformer(nn.Module):
     separately before modulation, matching the content/style split used in
     class.py.
     """
-    def __init__(self, input_dim, num_parts=6, part_dim=None, num_enc_layers=2, num_dec_layers=3, num_heads=4):
+    def __init__(
+        self,
+        input_dim,
+        num_parts=6,
+        part_dim=None,
+        num_enc_layers=2,
+        num_dec_layers=3,
+        num_heads=4,
+        style_decoder_gate_init=0.0,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.num_parts = num_parts
@@ -214,7 +223,7 @@ class StyleTransformer(nn.Module):
         self.decoder_query = nn.Parameter(torch.randn(num_parts, part_dim))
         self.decoder = TransformerDecoder(part_dim, num_heads=num_heads, num_layers=num_dec_layers, num_parts=num_parts)
         self.content_decoder_gate = nn.Parameter(torch.tensor(0.0))
-        self.style_decoder_gate = nn.Parameter(torch.tensor(-4.0))
+        self.style_decoder_gate = nn.Parameter(torch.tensor(float(style_decoder_gate_init)))
 
         # learnable style tokens, one token per body part, matching class.py
         self.learnable_style_token = nn.Parameter(torch.randn(1, num_parts, part_dim))
@@ -228,27 +237,38 @@ class StyleTransformer(nn.Module):
         # final proj
         self.out_proj = nn.Linear(input_dim, input_dim)
         self._generated_feature_contrib_sum = None
+        self._generated_feature_share_sum = None
         self._generated_feature_contrib_count = 0
+        self.record_generated_feature_contribution = True
 
-    def _record_generated_feature_contribution(self, weighted_generated_feature, output):
+    def _record_generated_feature_contribution(self, weighted_content_feature, weighted_generated_feature, output):
+        if not self.record_generated_feature_contribution:
+            return
         with torch.no_grad():
-            denominator = output.norm(p=2, dim=-1).clamp_min(1e-8)
-            contribution = (weighted_generated_feature.norm(p=2, dim=-1) / denominator).mean().detach()
+            generated_norm = weighted_generated_feature.norm(p=2, dim=-1)
+            content_norm = weighted_content_feature.norm(p=2, dim=-1)
+            contribution = (generated_norm / output.norm(p=2, dim=-1).clamp_min(1e-8)).mean().detach()
+            mixture_share = (generated_norm / (generated_norm + content_norm).clamp_min(1e-8)).mean().detach()
             if self._generated_feature_contrib_sum is None:
                 self._generated_feature_contrib_sum = contribution
+                self._generated_feature_share_sum = mixture_share
             else:
                 self._generated_feature_contrib_sum = self._generated_feature_contrib_sum + contribution
+                self._generated_feature_share_sum = self._generated_feature_share_sum + mixture_share
             self._generated_feature_contrib_count += 1
 
     def get_and_reset_generated_feature_contribution(self):
         if self._generated_feature_contrib_count == 0 or self._generated_feature_contrib_sum is None:
             return None
         contribution = self._generated_feature_contrib_sum / self._generated_feature_contrib_count
+        mixture_share = self._generated_feature_share_sum / self._generated_feature_contrib_count
         stats = {
             "contribution_ratio": float(contribution.item()),
+            "mixture_share": float(mixture_share.item()),
             "num_forwards": int(self._generated_feature_contrib_count),
         }
         self._generated_feature_contrib_sum = None
+        self._generated_feature_share_sum = None
         self._generated_feature_contrib_count = 0
         return stats
 
@@ -293,21 +313,32 @@ class StyleTransformer(nn.Module):
         generated_tokens = decode_tokens(cnt_enc_IN + modulated_tokens, modulated)
         return self.motion_proj(generated_tokens.reshape(B, -1))
 
-    def forward(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
+    def generate_feature(
+        self,
+        cnt,
+        sty: Optional[torch.Tensor] = None,
+        content_only: bool = False,
+        record_contribution: bool = True,
+    ):
         generated_motion = self.generate_motion(cnt, sty=sty, content_only=content_only)
 
         if content_only:
             generated_feature = self.out_proj(generated_motion)
             gate = torch.sigmoid(self.content_decoder_gate)
             output = (1 - gate) * cnt + gate * generated_feature
-            self._record_generated_feature_contribution(gate * generated_feature, output)
+            if record_contribution:
+                self._record_generated_feature_contribution((1 - gate) * cnt, gate * generated_feature, output)
             return output
 
         styled = self.out_proj(generated_motion)
         gate = torch.sigmoid(self.style_decoder_gate)
         output = (1 - gate) * cnt + gate * styled
-        self._record_generated_feature_contribution(gate * styled, output)
+        if record_contribution:
+            self._record_generated_feature_contribution((1 - gate) * cnt, gate * styled, output)
         return output
+
+    def forward(self, cnt, sty: Optional[torch.Tensor] = None, content_only: bool = False):
+        return self.generate_feature(cnt, sty=sty, content_only=content_only)
 
 
 class ForwardProcDict(nn.Module):
@@ -438,6 +469,8 @@ class ActorCritic(nn.Module):
                         style_num_enc_layers=2,
                         style_num_dec_layers=3,
                         style_num_heads=4,
+                        re_init_style_decoder_gate=False,
+                        style_decoder_gate_init=0.0,
                         **kwargs):
         if kwargs:
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -460,6 +493,7 @@ class ActorCritic(nn.Module):
         self.head_lr_scale = float(head_lr_scale)
         self.base_lr_scale = float(base_lr_scale)
         self.style_lr_warmup_steps = int(style_lr_warmup_steps)
+        self.style_decoder_gate_init = float(style_decoder_gate_init)
 
         actor_shared_shapes, actor_shared_spec, actor_stream_shapes, actor_stream_spec = _split_obs_streams(obs_shapes, obs_proc_actor)
         critic_shared_shapes, critic_shared_spec, critic_stream_shapes, critic_stream_spec = _split_obs_streams(obs_shapes, obs_proc_critic)
@@ -477,6 +511,7 @@ class ActorCritic(nn.Module):
                 num_enc_layers=style_num_enc_layers,
                 num_dec_layers=style_num_dec_layers,
                 num_heads=style_num_heads,
+                style_decoder_gate_init=self.style_decoder_gate_init,
             )
 
         def _build_stream_module(prefix, shared_shapes, shared_spec, stream_shapes, stream_spec, hidden_dim):
@@ -647,6 +682,29 @@ class ActorCritic(nn.Module):
                 stats[module_name] = module_stats
         return stats
 
+    def get_decoder_gate_stats(self) -> Dict[str, Dict[str, float]]:
+        stats = {}
+        for module_name, module in self.named_modules():
+            if not isinstance(module, StyleTransformer):
+                continue
+            stats[module_name] = {
+                "content": float(torch.sigmoid(module.content_decoder_gate.detach()).item()),
+                "style": float(torch.sigmoid(module.style_decoder_gate.detach()).item()),
+            }
+        return stats
+
+    def _set_generated_feature_contribution_recording(self, enabled: bool):
+        previous_states = []
+        for module in self.modules():
+            if isinstance(module, StyleTransformer):
+                previous_states.append((module, module.record_generated_feature_contribution))
+                module.record_generated_feature_contribution = enabled
+        return previous_states
+
+    def _restore_generated_feature_contribution_recording(self, previous_states):
+        for module, previous_state in previous_states:
+            module.record_generated_feature_contribution = previous_state
+
     def get_optimizer_param_groups(self, base_lr: float):
         grouped_params = {
             "base": [],
@@ -669,6 +727,12 @@ class ActorCritic(nn.Module):
     
     def re_init_std(self, init_noise_std=1.0):
         self.std.data[:] = init_noise_std 
+
+    def re_init_style_decoder_gates(self, gate_logit=0.0):
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, StyleTransformer):
+                    module.style_decoder_gate.fill_(float(gate_logit))
 
     @staticmethod
     # not used at the moment
@@ -894,10 +958,18 @@ class ActorCritic(nn.Module):
         if not isinstance(backbone, StyleTransformer):
             return {}
 
-        generated_token_motion = backbone.generate_motion(content_feat, sty=style_feat, content_only=False)
-        reconstruction_motion = backbone.generate_motion(content_feat, sty=content_feat, content_only=False)
-        cycle_content_motion = backbone.generate_motion(generated_token_motion, sty=content_feat, content_only=False)
-        cycle_style_motion = backbone.generate_motion(style_feat, sty=generated_token_motion, content_only=False)
+        generated_token_motion = backbone.generate_feature(
+            content_feat, sty=style_feat, content_only=False, record_contribution=False
+        )
+        reconstruction_motion = backbone.generate_feature(
+            content_feat, sty=content_feat, content_only=False, record_contribution=False
+        )
+        cycle_content_motion = backbone.generate_feature(
+            generated_token_motion, sty=content_feat, content_only=False, record_contribution=False
+        )
+        cycle_style_motion = backbone.generate_feature(
+            style_feat, sty=generated_token_motion, content_only=False, record_contribution=False
+        )
 
         return {
             "content_token_motion": content_feat.detach(),
@@ -908,7 +980,81 @@ class ActorCritic(nn.Module):
             "cycle_style_motion": cycle_style_motion.detach(),
         }
 
-    def compute_style_auxiliary_losses(self, observations):
+    @staticmethod
+    def _select_same_style_reference_indices(style_labels, style_content_ids):
+        """Randomly pair each sample with the same style and different content."""
+        labels = style_labels.long().reshape(-1)
+        content_ids = style_content_ids.long().reshape(-1)
+        if labels.shape != content_ids.shape:
+            raise ValueError(
+                "style_labels and style_content_ids must have the same shape"
+            )
+        batch_size = labels.shape[0]
+        pair_indices = torch.arange(batch_size, device=labels.device)
+        valid_pairs = torch.zeros(batch_size, dtype=torch.bool, device=labels.device)
+        valid_metadata = (labels >= 0) & (content_ids >= 0)
+        unique_labels = torch.unique(labels[valid_metadata])
+
+        for label in unique_labels.tolist():
+            group = torch.nonzero(
+                valid_metadata & (labels == label), as_tuple=False
+            ).flatten()
+            group_content_ids = content_ids[group]
+            for content_id in torch.unique(group_content_ids).tolist():
+                sources = group[group_content_ids == content_id]
+                candidates = group[group_content_ids != content_id]
+                if candidates.numel() == 0:
+                    continue
+                sampled = torch.randint(
+                    candidates.numel(),
+                    (sources.numel(),),
+                    device=labels.device,
+                )
+                pair_indices[sources] = candidates[sampled]
+                valid_pairs[sources] = True
+        return pair_indices, valid_pairs
+
+    @staticmethod
+    def _select_different_style_reference_indices(style_labels, style_content_ids=None):
+        """Pair with a different style, preferring the same reference content."""
+        labels = style_labels.long().reshape(-1)
+        content_ids = None
+        if style_content_ids is not None:
+            content_ids = style_content_ids.long().reshape(-1)
+            if labels.shape != content_ids.shape:
+                raise ValueError(
+                    "style_labels and style_content_ids must have the same shape"
+                )
+        batch_size = labels.shape[0]
+        pair_indices = torch.arange(batch_size, device=labels.device)
+        valid_pairs = torch.zeros(batch_size, dtype=torch.bool, device=labels.device)
+        valid_labels = labels >= 0
+        for source_index in torch.nonzero(valid_labels, as_tuple=False).flatten().tolist():
+            candidate_mask = valid_labels & (labels != labels[source_index])
+            if content_ids is not None and content_ids[source_index] >= 0:
+                same_content_candidates = torch.nonzero(
+                    candidate_mask & (content_ids == content_ids[source_index]),
+                    as_tuple=False,
+                ).flatten()
+            else:
+                same_content_candidates = pair_indices.new_empty(0)
+            candidates = (
+                same_content_candidates
+                if same_content_candidates.numel() > 0
+                else torch.nonzero(candidate_mask, as_tuple=False).flatten()
+            )
+            if candidates.numel() == 0:
+                continue
+            sampled = torch.randint(
+                candidates.numel(),
+                (),
+                device=labels.device,
+            )
+            pair_indices[source_index] = candidates[sampled]
+            valid_pairs[source_index] = True
+        return pair_indices, valid_pairs
+
+    def compute_style_auxiliary_losses(self, observations, contrastive_margin=0.2):
         if not self.use_style_stream:
             return {}
 
@@ -947,10 +1093,130 @@ class ActorCritic(nn.Module):
         content_target = content_feat.detach()
         style_target = style_feat.detach()
 
-        generated_feature = backbone(content_target, sty=style_target, content_only=False)
-        reconstruction_feature = backbone(content_target, sty=content_target, content_only=False)
-        cycle_content_feature = backbone(generated_feature, sty=content_target, content_only=False)
-        cycle_style_feature = backbone(style_target, sty=generated_feature, content_only=False)
+        def generate_feature(cnt, sty):
+            return backbone.generate_feature(
+                cnt,
+                sty=sty,
+                content_only=False,
+                record_contribution=False,
+            )
+
+        generated_feature = generate_feature(content_target, style_target)
+        reconstruction_feature = generate_feature(content_target, content_target)
+        cycle_content_feature = generate_feature(generated_feature, content_target)
+        cycle_style_feature = generate_feature(style_target, generated_feature)
+        style_consistency_loss = generated_feature.new_zeros(())
+        style_contrastive_loss = generated_feature.new_zeros(())
+        eps = 1e-6
+        generated_residual = generated_feature - content_target
+        generated_latent_rms = generated_feature.pow(2).mean(dim=-1).add(eps).sqrt()
+        content_latent_rms = content_target.pow(2).mean(dim=-1).add(eps).sqrt()
+        real_latent_rms = style_target.pow(2).mean(dim=-1).add(eps).sqrt()
+        target_latent_rms = 0.5 * (content_latent_rms + real_latent_rms)
+        latent_norm_log_ratio = torch.log(
+            generated_latent_rms / target_latent_rms.detach().clamp_min(eps)
+        )
+        style_norm_anchor_loss = latent_norm_log_ratio.pow(2).mean()
+        consistency_stats = {
+            "style_consistency_mean": generated_feature.new_zeros(()),
+            "style_consistency_median": generated_feature.new_zeros(()),
+            "style_consistency_p90": generated_feature.new_zeros(()),
+            "style_consistency_max": generated_feature.new_zeros(()),
+            "style_consistency_normalized": generated_feature.new_zeros(()),
+            "style_consistency_pair_fraction": generated_feature.new_zeros(()),
+            "style_consistency_distinct_reference_fraction": generated_feature.new_zeros(()),
+            "style_contrastive_loss": generated_feature.new_zeros(()),
+            "style_contrastive_active_fraction": generated_feature.new_zeros(()),
+            "style_contrastive_pair_fraction": generated_feature.new_zeros(()),
+            "style_positive_cosine_distance": generated_feature.new_zeros(()),
+            "style_negative_cosine_distance": generated_feature.new_zeros(()),
+            "generated_latent_rms": generated_latent_rms.detach().mean(),
+            "generated_latent_rms_p90": torch.quantile(generated_latent_rms.detach(), 0.9),
+            "generated_latent_rms_max": generated_latent_rms.detach().max(),
+            "content_latent_rms": content_latent_rms.detach().mean(),
+            "real_latent_rms": real_latent_rms.detach().mean(),
+            "generated_to_target_latent_rms_ratio": (
+                generated_latent_rms.detach() / target_latent_rms.detach().clamp_min(eps)
+            ).mean(),
+            "generated_residual_rms": generated_residual.detach().pow(2).mean(dim=-1).sqrt().mean(),
+            "style_norm_anchor_loss": style_norm_anchor_loss.detach(),
+        }
+        style_labels = observations.get("style_label")
+        style_content_ids = observations.get("style_content_id")
+        if (
+            style_labels is not None
+            and style_content_ids is not None
+            and style_target.shape[0] > 1
+        ):
+            consistency_indices, valid_consistency_pairs = self._select_same_style_reference_indices(
+                style_labels,
+                style_content_ids,
+            )
+            contrastive_indices, valid_contrastive_pairs = self._select_different_style_reference_indices(
+                style_labels,
+                style_content_ids,
+            )
+            with torch.no_grad():
+                generated_with_same_style = generate_feature(
+                    content_target,
+                    style_target[consistency_indices],
+                )
+                generated_with_different_style = generate_feature(
+                    content_target,
+                    style_target[contrastive_indices],
+                )
+            same_style_residual = generated_with_same_style - content_target
+            different_style_residual = generated_with_different_style - content_target
+            consistency_error = F.mse_loss(
+                generated_residual,
+                same_style_residual,
+                reduction="none",
+            ).mean(dim=-1)
+            positive_distance = 1.0 - F.cosine_similarity(
+                generated_residual,
+                same_style_residual,
+                dim=-1,
+                eps=eps,
+            )
+            if valid_consistency_pairs.any():
+                valid_error = consistency_error[valid_consistency_pairs]
+                valid_positive_distance = positive_distance[valid_consistency_pairs]
+                style_consistency_loss = valid_positive_distance.mean()
+                consistency_stats.update({
+                    "style_consistency_mean": valid_error.detach().mean(),
+                    "style_consistency_median": valid_error.detach().median(),
+                    "style_consistency_p90": torch.quantile(valid_error.detach(), 0.9),
+                    "style_consistency_max": valid_error.detach().max(),
+                    "style_consistency_normalized": valid_positive_distance.detach().mean(),
+                    "style_positive_cosine_distance": valid_positive_distance.detach().mean(),
+                    "style_consistency_distinct_reference_fraction": (
+                        torch.unique(consistency_indices[valid_consistency_pairs]).numel()
+                        / valid_consistency_pairs.sum()
+                    ),
+                })
+            consistency_stats["style_consistency_pair_fraction"] = (
+                valid_consistency_pairs.float().mean()
+            )
+            valid_triplets = valid_consistency_pairs & valid_contrastive_pairs
+            if valid_triplets.any():
+                negative_distance = 1.0 - F.cosine_similarity(
+                    generated_residual,
+                    different_style_residual,
+                    dim=-1,
+                    eps=eps,
+                )
+                triplet_loss = F.relu(
+                    positive_distance[valid_triplets]
+                    - negative_distance[valid_triplets]
+                    + float(contrastive_margin)
+                )
+                style_contrastive_loss = triplet_loss.mean()
+                consistency_stats.update({
+                    "style_contrastive_loss": style_contrastive_loss.detach(),
+                    "style_contrastive_active_fraction": (triplet_loss.detach() > 0).float().mean(),
+                    "style_contrastive_pair_fraction": valid_triplets.float().mean(),
+                    "style_negative_cosine_distance": negative_distance[valid_triplets].detach().mean(),
+                })
 
         if generated_feature.shape[-1] % backbone.num_parts == 0:
             generated_style = generated_feature.view(generated_feature.shape[0], backbone.num_parts, -1)
@@ -969,6 +1235,13 @@ class ActorCritic(nn.Module):
             "recon": F.mse_loss(reconstruction_feature, content_target),
             "cycle_content": F.mse_loss(cycle_content_feature, content_target),
             "cycle_style": F.mse_loss(cycle_style_feature, style_target) + style_stat_loss,
+            "style_consistency": style_consistency_loss,
+            "style_contrastive": style_contrastive_loss,
+            "style_norm_anchor": style_norm_anchor_loss,
+            "latent_generated_feature": generated_feature,
+            "latent_real_style_feature": style_target,
+            "latent_style_label": None if style_labels is None else style_labels.long().reshape(-1),
+            **consistency_stats,
         }
 
     def _make_zero_stream_feature(self, reference_tensor: torch.Tensor, feature_dim: int, fallback_parameter: Optional[torch.Tensor] = None):
@@ -1063,6 +1336,109 @@ class ActorCritic(nn.Module):
             return None, None
         fused = torch.cat(features, dim=-1)
         return fused, extra_proj_outputs
+
+    def compute_style_action_sensitivity(
+        self,
+        observations,
+        style_labels,
+        style_content_ids,
+        eps=1e-6,
+    ):
+        """Measure within-style invariance and cross-style action sensitivity."""
+        if not self.use_style_stream or not isinstance(observations, dict):
+            return {}
+        if style_labels is None or style_content_ids is None:
+            return {}
+
+        labels = style_labels.long().reshape(-1)
+        content_ids = style_content_ids.long().reshape(-1)
+        batch_size = labels.shape[0]
+        style_tensors = [
+            value
+            for key, value in observations.items()
+            if key.startswith("style_")
+            and torch.is_tensor(value)
+            and value.is_floating_point()
+            and value.ndim > 0
+            and value.shape[0] == batch_size
+        ]
+        if len(style_tensors) == 0 or batch_size <= 1:
+            return {}
+
+        same_indices, same_valid = self._select_same_style_reference_indices(
+            labels, content_ids
+        )
+        different_indices, different_valid = self._select_different_style_reference_indices(
+            labels
+        )
+        style_vector = torch.cat(
+            [value.detach().reshape(batch_size, -1) for value in style_tensors], dim=-1
+        )
+
+        def replace_style(reference_indices):
+            return {
+                key: value[reference_indices]
+                if key.startswith("style_")
+                and torch.is_tensor(value)
+                and value.ndim > 0
+                and value.shape[0] == batch_size
+                else value
+                for key, value in observations.items()
+            }
+
+        previous_states = self._set_generated_feature_contribution_recording(False)
+        was_training = self.training
+        try:
+            self.eval()
+            with torch.no_grad():
+                base_features, _ = self._fuse_actor_features(observations)
+                same_features, _ = self._fuse_actor_features(replace_style(same_indices))
+                different_features, _ = self._fuse_actor_features(replace_style(different_indices))
+                if base_features is None or same_features is None or different_features is None:
+                    return {}
+                base_actions = self.actor(base_features)
+                same_actions = self.actor(same_features)
+                different_actions = self.actor(different_features)
+
+                def pair_stats(paired_actions, reference_indices, valid):
+                    if not valid.any():
+                        zero = base_actions.new_zeros(())
+                        return zero, zero
+                    action_delta = torch.norm(
+                        base_actions[valid] - paired_actions[valid], p=2, dim=-1
+                    )
+                    style_delta = torch.sqrt(
+                        (
+                            style_vector[valid]
+                            - style_vector[reference_indices[valid]]
+                        ).pow(2).mean(dim=-1)
+                    )
+                    return action_delta.mean(), (
+                        action_delta / style_delta.clamp_min(eps)
+                    ).mean()
+
+                same_delta, same_ratio = pair_stats(
+                    same_actions, same_indices, same_valid
+                )
+                different_delta, different_ratio = pair_stats(
+                    different_actions, different_indices, different_valid
+                )
+                return {
+                    "style_action_sensitivity": different_delta,
+                    "style_action_sensitivity_same_label": same_delta,
+                    "style_action_sensitivity_different_label": different_delta,
+                    "style_action_sensitivity_same_label_ratio": same_ratio,
+                    "style_action_sensitivity_different_label_ratio": different_ratio,
+                    "style_action_sensitivity_between_within_ratio": (
+                        different_delta / same_delta.clamp_min(eps)
+                    ),
+                    "style_action_sensitivity_same_pair_fraction": same_valid.float().mean(),
+                    "style_action_sensitivity_different_pair_fraction": different_valid.float().mean(),
+                }
+        finally:
+            if was_training:
+                self.train()
+            self._restore_generated_feature_contribution_recording(previous_states)
     
     def update_distribution(self, observations, call_input_net=True):
         extra_proj_outputs = None
